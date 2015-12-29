@@ -2065,7 +2065,7 @@ static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_p
     DEVICE_OBJECT *dev_obj;
     NTSTATUS status;
     const WCHAR *windows_ports_key_name;
-    struct set_dosdev_symlink_params params = { dosdevices_path, unix_path };
+    struct set_dosdev_symlink_params params = { dosdevices_path, unix_path, driver == serial_driver };
 
     /* create DOS device */
     if (MOUNTMGR_CALL( set_dosdev_symlink, &params )) return FALSE;
