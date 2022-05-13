@@ -449,6 +449,7 @@ static void test_MeshBuilder(void)
     DWORD size;
     D3DCOLOR color;
     IUnknown *unk;
+    D3DRMBOX box;
 
     hr = Direct3DRMCreate(&d3drm);
     ok(hr == D3DRM_OK, "Cannot get IDirect3DRM interface, hr %#lx\n", hr);
@@ -693,6 +694,13 @@ static void test_MeshBuilder(void)
 
         IDirect3DRMMesh_Release(mesh);
     }
+
+    memset(&box, 0, sizeof(box));
+    hr = IDirect3DRMMeshBuilder_GetBox(pMeshBuilder, &box);
+    ok(hr == D3DRM_OK, "got hr %#lx.\n", hr);
+
+    expect_vector(&box.min, 1.0, 2.0f, 3.0f, 1);
+    expect_vector(&box.max, 6.9f, 8.0f, 8.9f, 1);
 
     hr = IDirect3DRMMeshBuilder_Scale(pMeshBuilder, 2, 3 ,4);
     ok(hr == D3DRM_OK, "Scale failed returning hr %#lx.\n", hr);
