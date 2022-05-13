@@ -1452,28 +1452,37 @@ static HRESULT WINAPI d3drm_frame1_GetParent(IDirect3DRMFrame *iface, IDirect3DR
     return d3drm_frame2_GetParent(&frame->IDirect3DRMFrame2_iface, parent);
 }
 
+static HRESULT frame_get_position(struct d3drm_frame *frame, struct d3drm_frame *reference, D3DVECTOR *position)
+{
+    // TODO
+    return S_OK;
+}
+
 static HRESULT WINAPI d3drm_frame3_GetPosition(IDirect3DRMFrame3 *iface,
         IDirect3DRMFrame3 *reference, D3DVECTOR *position)
 {
-    FIXME("iface %p, reference %p, position %p stub!\n", iface, reference, position);
-
-    return E_NOTIMPL;
+    struct d3drm_frame *frame = impl_from_IDirect3DRMFrame3(iface);
+    struct d3drm_frame *ref = impl_from_IDirect3DRMFrame3(reference);
+    TRACE("iface %p, reference %p, position %p\n", iface, ref, position);
+    return frame_get_position(frame, NULL, position);
 }
 
 static HRESULT WINAPI d3drm_frame2_GetPosition(IDirect3DRMFrame2 *iface,
         IDirect3DRMFrame *reference, D3DVECTOR *position)
 {
-    FIXME("iface %p, reference %p, position %p stub!\n", iface, reference, position);
-
-    return E_NOTIMPL;
+    struct d3drm_frame *frame = impl_from_IDirect3DRMFrame2(iface);
+    struct d3drm_frame *ref = impl_from_IDirect3DRMFrame(reference);
+    TRACE("iface %p, reference %p, position %p\n", iface, ref, position);
+    return frame_get_position(frame, NULL, position);
 }
 
 static HRESULT WINAPI d3drm_frame1_GetPosition(IDirect3DRMFrame *iface,
         IDirect3DRMFrame *reference, D3DVECTOR *position)
 {
-    FIXME("iface %p, reference %p, position %p stub!\n", iface, reference, position);
-
-    return E_NOTIMPL;
+    struct d3drm_frame *frame = impl_from_IDirect3DRMFrame(iface);
+    struct d3drm_frame *ref = impl_from_IDirect3DRMFrame(reference);
+    TRACE("iface %p, reference %p, position %p\n", iface, reference, position);
+    return frame_get_position(frame, ref, position);
 }
 
 
@@ -2449,7 +2458,7 @@ static HRESULT WINAPI d3drm_frame3_SetPosition(IDirect3DRMFrame3 *iface,
 {
     FIXME("iface %p, reference %p, x %.8e, y %.8e, z %.8e stub!\n", iface, reference, x, y, z);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_frame2_SetPosition(IDirect3DRMFrame2 *iface,
@@ -2457,7 +2466,7 @@ static HRESULT WINAPI d3drm_frame2_SetPosition(IDirect3DRMFrame2 *iface,
 {
     FIXME("iface %p, reference %p, x %.8e, y %.8e, z %.8e stub!\n", iface, reference, x, y, z);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_frame1_SetPosition(IDirect3DRMFrame *iface,
