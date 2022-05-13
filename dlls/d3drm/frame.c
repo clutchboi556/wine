@@ -608,6 +608,8 @@ static ULONG WINAPI d3drm_frame3_Release(IDirect3DRMFrame3 *iface)
 
     if (!refcount)
     {
+        if (frame->backgroundimage)
+            IUnknown_Release(frame->backgroundimage);
         d3drm_object_cleanup((IDirect3DRMObject *)&frame->IDirect3DRMFrame_iface, &frame->obj);
         for (i = 0; i < frame->nb_children; ++i)
         {
@@ -2231,25 +2233,47 @@ static HRESULT WINAPI d3drm_frame1_SetSceneBackgroundDepth(IDirect3DRMFrame *ifa
 static HRESULT WINAPI d3drm_frame3_SetSceneBackgroundImage(IDirect3DRMFrame3 *iface,
         IDirect3DRMTexture3 *texture)
 {
-    FIXME("iface %p, texture %p stub!\n", iface, texture);
+    struct d3drm_frame *frame = impl_from_IDirect3DRMFrame3(iface);
+    IUnknown *unk = NULL;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, texture %p\n", iface, texture);
+
+    if (texture)
+        IDirect3DRMTexture3_QueryInterface(texture, &IID_IUnknown, (void**)&unk);
+
+    if (frame->backgroundimage)
+        IUnknown_Release(frame->backgroundimage);
+
+    frame->backgroundimage = unk;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_frame2_SetSceneBackgroundImage(IDirect3DRMFrame2 *iface,
         IDirect3DRMTexture *texture)
 {
-    FIXME("iface %p, texture %p stub!\n", iface, texture);
+    struct d3drm_frame *frame = impl_from_IDirect3DRMFrame2(iface);
+    IUnknown *unk = NULL;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, texture %p\n", iface, texture);
+
+    if (texture)
+        IDirect3DRMTexture_QueryInterface(texture, &IID_IUnknown, (void**)&unk);
+
+    if (frame->backgroundimage)
+        IUnknown_Release(frame->backgroundimage);
+
+    frame->backgroundimage = unk;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_frame1_SetSceneBackgroundImage(IDirect3DRMFrame *iface,
         IDirect3DRMTexture *texture)
 {
-    FIXME("iface %p, texture %p stub!\n", iface, texture);
-
-    return E_NOTIMPL;
+    struct d3drm_frame *frame = impl_from_IDirect3DRMFrame(iface);
+    TRACE("iface %p, texture %p\n", iface, texture);
+    return d3drm_frame2_SetSceneBackgroundImage(&frame->IDirect3DRMFrame2_iface, texture);
 }
 
 static HRESULT WINAPI d3drm_frame3_SetSceneFogEnable(IDirect3DRMFrame3 *iface, BOOL enable)
