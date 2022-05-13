@@ -402,9 +402,90 @@ static ULONG WINAPI d3drm_mesh_builder2_Release(IDirect3DRMMeshBuilder2 *iface)
 static HRESULT WINAPI d3drm_mesh_builder2_Clone(IDirect3DRMMeshBuilder2 *iface,
         IUnknown *outer, REFIID iid, void **out)
 {
-    FIXME("iface %p, outer %p, iid %s, out %p stub!\n", iface, outer, debugstr_guid(iid), out);
+    struct d3drm_mesh_builder *mesh_builder = impl_from_IDirect3DRMMeshBuilder2(iface);
+    struct d3drm_mesh_builder *mesh2;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    FIXME("iface %p, outer %p, iid %s, out %p Semi-stub\n", iface, outer, debugstr_guid(iid), out);
+
+    if (outer)
+        FIXME("outer currently ignored\n");
+
+    *out = NULL;
+
+    hr = d3drm_mesh_builder_create(&mesh2, mesh_builder->d3drm);
+    if(SUCCEEDED(hr))
+    {
+        mesh2->nb_vertices = mesh_builder->nb_vertices;
+        mesh2->vertices_size = mesh_builder->vertices_size;
+        if (mesh_builder->vertices && mesh_builder->nb_vertices)
+        {
+            if (!d3drm_array_reserve((void **)&mesh2->vertices, &mesh_builder->vertices_size, mesh_builder->nb_vertices,
+                        sizeof(*mesh_builder->vertices)))
+            {
+                IDirect3DRMMeshBuilder2_Release(&mesh2->IDirect3DRMMeshBuilder2_iface);
+                return E_OUTOFMEMORY;
+            }
+            memcpy(mesh2->vertices, mesh_builder->vertices, mesh_builder->nb_vertices * sizeof(*mesh_builder->vertices));
+        }
+
+        mesh2->nb_normals = mesh_builder->nb_normals;
+        mesh2->normals_size = mesh_builder->normals_size;
+        if (mesh_builder->normals && mesh_builder->nb_normals)
+        {
+            if (!d3drm_array_reserve((void **)&mesh2->normals, &mesh_builder->normals_size,
+                mesh_builder->nb_vertices, sizeof(*mesh_builder->normals)))
+            {
+                IDirect3DRMMeshBuilder2_Release(&mesh2->IDirect3DRMMeshBuilder2_iface);
+                return E_OUTOFMEMORY;
+            }
+            memcpy(mesh2->normals, mesh_builder->normals, mesh_builder->nb_normals * sizeof(*mesh_builder->normals));
+        }
+
+        mesh2->nb_faces = mesh_builder->nb_faces;
+        mesh2->face_data_size = mesh_builder->face_data_size;
+        if (mesh_builder->pFaceData && mesh_builder->face_data_size)
+        {
+            mesh2->pFaceData = malloc(mesh_builder->face_data_size * 2);
+            if(!mesh2->pFaceData)
+            {
+                IDirect3DRMMeshBuilder2_Release(&mesh2->IDirect3DRMMeshBuilder2_iface);
+                return E_OUTOFMEMORY;
+            }
+            memcpy(mesh2->pFaceData, mesh_builder->pFaceData, mesh_builder->face_data_size * 2);
+        }
+
+        mesh2->nb_coords2d = mesh_builder->nb_coords2d;
+        if (mesh_builder->pCoords2d && mesh_builder->nb_coords2d)
+        {
+            mesh2->pCoords2d = calloc(mesh_builder->nb_coords2d, sizeof(*mesh_builder->pCoords2d));
+            if (!mesh2->pCoords2d)
+            {
+                IDirect3DRMMeshBuilder2_Release(&mesh2->IDirect3DRMMeshBuilder2_iface);
+                return E_OUTOFMEMORY;
+            }
+            memcpy(mesh2->pCoords2d, mesh_builder->pCoords2d, mesh_builder->nb_coords2d * sizeof(*mesh_builder->pCoords2d));
+        }
+
+        mesh2->color = mesh_builder->color;
+        mesh2->material = mesh_builder->material;
+        if (mesh2->material)
+            IDirect3DRMTexture2_AddRef(mesh2->material);
+        mesh2->texture = mesh_builder->texture;
+        if (mesh2->texture)
+            IDirect3DRMTexture2_AddRef(mesh2->texture);
+        mesh2->nb_materials = mesh_builder->nb_materials;
+        if (mesh2->nb_materials > 0)
+            FIXME("materials NOT copied yet\n");
+        //struct mesh_material *materials;
+        //DWORD *material_indices;
+        mesh2->quality = mesh_builder->quality;
+
+        hr = IDirect3DRMMeshBuilder2_QueryInterface(&mesh2->IDirect3DRMMeshBuilder2_iface, iid, out);
+        IDirect3DRMMeshBuilder2_Release(&mesh2->IDirect3DRMMeshBuilder3_iface);
+    }
+
+    return hr;
 }
 
 static HRESULT WINAPI d3drm_mesh_builder2_AddDestroyCallback(IDirect3DRMMeshBuilder2 *iface,
