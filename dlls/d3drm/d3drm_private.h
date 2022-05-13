@@ -78,6 +78,7 @@ struct d3drm_frame
     IDirect3DRMFrame3 IDirect3DRMFrame3_iface;
     IDirect3DRM *d3drm;
     LONG ref;
+    IUnknown *backgroundimage;
     struct d3drm_frame *parent;
     SIZE_T nb_children;
     SIZE_T children_size;
