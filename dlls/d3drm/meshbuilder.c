@@ -612,7 +612,7 @@ static HRESULT WINAPI d3drm_mesh_builder2_Translate(IDirect3DRMMeshBuilder2 *ifa
 {
     FIXME("iface %p, tx %.8e, ty %.8e, tz %.8e stub!\n", iface, tx, ty, tz);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_mesh_builder2_SetColorSource(IDirect3DRMMeshBuilder2 *iface, D3DRMCOLORSOURCE source)
