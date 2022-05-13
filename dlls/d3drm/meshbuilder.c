@@ -626,7 +626,7 @@ static HRESULT WINAPI d3drm_mesh_builder2_GetBox(IDirect3DRMMeshBuilder2 *iface,
 {
     FIXME("iface %p, box %p stub!\n", iface, box);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_mesh_builder2_GenerateNormals(IDirect3DRMMeshBuilder2 *iface)
@@ -2594,7 +2594,7 @@ static HRESULT WINAPI d3drm_mesh_GetBox(IDirect3DRMMesh *iface, D3DRMBOX *box)
 {
     FIXME("iface %p, box %p stub!\n", iface, box);
 
-    return E_NOTIMPL;
+    return D3DRMERR_BOXNOTSET;
 }
 
 static HRESULT WINAPI d3drm_mesh_AddGroup(IDirect3DRMMesh *iface, unsigned vertex_count,
