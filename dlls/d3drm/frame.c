@@ -1800,7 +1800,7 @@ static HRESULT WINAPI d3drm_frame2_LookAt(IDirect3DRMFrame2 *iface, IDirect3DRMF
 {
     FIXME("iface %p, target %p, reference %p, constraint %#x stub!\n", iface, target, reference, constraint);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_frame1_LookAt(IDirect3DRMFrame *iface, IDirect3DRMFrame *target,
