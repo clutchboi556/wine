@@ -679,7 +679,9 @@ static HRESULT WINAPI d3drm_mesh_builder2_AddFaces(IDirect3DRMMeshBuilder2 *ifac
     FIXME("iface %p, vertex_count %lu, vertices %p, normal_count %lu, normals %p, face_data %p, array %p stub!\n",
             iface, vertex_count, vertices, normal_count, normals, face_data, array);
 
-    return E_NOTIMPL;
+    if (array)
+        *array = NULL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_mesh_builder2_ReserveSpace(IDirect3DRMMeshBuilder2 *iface,
