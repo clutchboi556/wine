@@ -761,9 +761,10 @@ static HRESULT WINAPI d3drm_mesh_builder2_SetQuality(IDirect3DRMMeshBuilder2 *if
 
 static HRESULT WINAPI d3drm_mesh_builder2_SetPerspective(IDirect3DRMMeshBuilder2 *iface, BOOL enable)
 {
-    FIXME("iface %p, enable %#x stub!\n", iface, enable);
+    struct d3drm_mesh_builder *mesh_builder = impl_from_IDirect3DRMMeshBuilder2(iface);
+    TRACE("iface %p, enable %#x\n", iface, enable);
 
-    return E_NOTIMPL;
+    return IDirect3DRMMeshBuilder3_SetPerspective(&mesh_builder->IDirect3DRMMeshBuilder3_iface, enable);
 }
 
 static HRESULT WINAPI d3drm_mesh_builder2_SetVertex(IDirect3DRMMeshBuilder2 *iface,
@@ -1847,7 +1848,7 @@ static HRESULT WINAPI d3drm_mesh_builder3_SetPerspective(IDirect3DRMMeshBuilder3
 {
     FIXME("iface %p, enable %#x stub!\n", iface, enable);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_mesh_builder3_SetVertex(IDirect3DRMMeshBuilder3 *iface,
