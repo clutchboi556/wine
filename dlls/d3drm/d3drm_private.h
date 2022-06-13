@@ -161,7 +161,7 @@ struct d3drm_mesh_builder
     DWORD nb_faces;
     DWORD face_data_size;
     void *pFaceData;
-    DWORD nb_coords2d;
+    SIZE_T nb_coords2d;
     struct coords_2d *pCoords2d;
     D3DCOLOR color;
     IDirect3DRMMaterial2 *material;

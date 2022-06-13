@@ -1232,7 +1232,7 @@ HRESULT load_mesh_data(IDirect3DRMMeshBuilder3 *iface, IDirectXFileData *pData,
 
             mesh_builder->nb_coords2d = *(DWORD*)ptr;
 
-            TRACE("MeshTextureCoords: nb_coords2d = %ld\n", mesh_builder->nb_coords2d);
+            TRACE("MeshTextureCoords: nb_coords2d = %Iu\n", mesh_builder->nb_coords2d);
 
             mesh_builder->pCoords2d = calloc(mesh_builder->nb_coords2d, sizeof(*mesh_builder->pCoords2d));
             memcpy(mesh_builder->pCoords2d, ptr + sizeof(DWORD), mesh_builder->nb_coords2d * sizeof(*mesh_builder->pCoords2d));
@@ -1948,6 +1948,10 @@ static int WINAPI d3drm_mesh_builder3_AddVertex(IDirect3DRMMeshBuilder3 *iface,
     mesh_builder->vertices[mesh_builder->nb_vertices].x = x;
     mesh_builder->vertices[mesh_builder->nb_vertices].y = y;
     mesh_builder->vertices[mesh_builder->nb_vertices].z = z;
+
+    if (!d3drm_array_reserve((void **)&mesh_builder->pCoords2d, &mesh_builder->nb_coords2d,
+            mesh_builder->nb_coords2d + 1, sizeof(*mesh_builder->pCoords2d)))
+        return 0;
 
     return mesh_builder->nb_vertices++;
 }
