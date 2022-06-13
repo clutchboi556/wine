@@ -631,9 +631,10 @@ static HRESULT WINAPI d3drm_mesh_builder2_GetBox(IDirect3DRMMeshBuilder2 *iface,
 
 static HRESULT WINAPI d3drm_mesh_builder2_GenerateNormals(IDirect3DRMMeshBuilder2 *iface)
 {
-    FIXME("iface %p stub!\n", iface);
+    struct d3drm_mesh_builder *mesh_builder = impl_from_IDirect3DRMMeshBuilder2(iface);
+    TRACE("iface %p\n", iface);
 
-    return E_NOTIMPL;
+    return IDirect3DRMMeshBuilder3_GenerateNormals(&mesh_builder->IDirect3DRMMeshBuilder3_iface, 0, 0);
 }
 
 static D3DRMCOLORSOURCE WINAPI d3drm_mesh_builder2_GetColorSource(IDirect3DRMMeshBuilder2 *iface)
@@ -1710,7 +1711,7 @@ static HRESULT WINAPI d3drm_mesh_builder3_GenerateNormals(IDirect3DRMMeshBuilder
 {
     FIXME("iface %p, crease %.8e, flags %#lx stub!\n", iface, crease, flags);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static D3DRMCOLORSOURCE WINAPI d3drm_mesh_builder3_GetColorSource(IDirect3DRMMeshBuilder3 *iface)
