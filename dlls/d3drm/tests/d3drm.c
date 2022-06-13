@@ -851,6 +851,53 @@ static void test_Mesh(void)
     IDirect3DRM_Release(d3drm);
 }
 
+static void test_Mesh_Vertices(void)
+{
+    HRESULT hr;
+    IDirect3DRM *d3drm;
+    IDirect3DRM2 *d3drm2;
+    IDirect3DRMMesh *mesh;
+    IDirect3DRMMeshBuilder2 *builder;
+    D3DVALUE u, v;
+    int idx;
+
+    hr = Direct3DRMCreate(&d3drm);
+    ok(hr == D3DRM_OK, "Cannot get IDirect3DRM interface, hr %#lx\n", hr);
+
+    if (FAILED(hr = IDirect3DRM_QueryInterface(d3drm, &IID_IDirect3DRM2, (void **)&d3drm2)))
+    {
+        win_skip("Cannot get IDirect3DRM2 interface, hr %#lx, skipping tests\n", hr);
+        IDirect3DRM_Release(d3drm);
+        return;
+    }
+
+    hr = IDirect3DRM_CreateMesh(d3drm, &mesh);
+    ok(hr == D3DRM_OK, "Cannot get IDirect3DRMMesh interface, hr %#lx\n", hr);
+
+    hr = IDirect3DRM2_CreateMeshBuilder(d3drm2, &builder);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+
+    idx = IDirect3DRMMeshBuilder_AddVertex(builder, -2.95f, 0.0f, 2.95f);
+    ok(idx == 0, "got hr %d\n", idx);
+
+    hr = IDirect3DRMMeshBuilder_SetTextureCoordinates(builder, 0, 0.0f, 0.0f);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+
+    idx = IDirect3DRMMeshBuilder_AddVertex(builder, -2.95f, 0.0f, 2.95f);
+    ok(idx == 1, "got hr %d\n", idx);
+
+    hr = IDirect3DRMMeshBuilder_GetTextureCoordinates(builder, idx, &u, &v);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+    ok(u == 0.0f, "got hr %.8e\n", u);
+    ok(v == 0.0f, "got hr %.8e\n", v);
+
+    IDirect3DRMMeshBuilder_Release(builder);
+    IDirect3DRMMesh_Release(mesh);
+
+    IDirect3DRM2_Release(d3drm2);
+    IDirect3DRM_Release(d3drm);
+}
+
 static void test_Face(void)
 {
     HRESULT hr;
@@ -8243,6 +8290,7 @@ START_TEST(d3drm)
     test_MeshBuilder();
     test_MeshBuilder3();
     test_Mesh();
+    test_Mesh_Vertices();
     test_Face();
     test_Frame();
     test_Device();
