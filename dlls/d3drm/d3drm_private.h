@@ -287,9 +287,13 @@ HRESULT d3drm_object_set_name(struct d3drm_object *object, const char *name);
 void d3drm_object_cleanup(IDirect3DRMObject *iface, struct d3drm_object *object);
 
 struct d3drm_frame *unsafe_impl_from_IDirect3DRMFrame(IDirect3DRMFrame *iface);
+struct d3drm_frame *unsafe_impl_from_IDirect3DRMFrame2(IDirect3DRMFrame2 *iface);
 struct d3drm_frame *unsafe_impl_from_IDirect3DRMFrame3(IDirect3DRMFrame3 *iface);
 
+struct d3drm_device *unsafe_impl_from_IDirect3DRMDevice(IDirect3DRMDevice *iface);
 struct d3drm_device *unsafe_impl_from_IDirect3DRMDevice3(IDirect3DRMDevice3 *iface);
+
+struct d3drm_texture *unsafe_impl_from_IDirect3DRMTexture(IDirect3DRMTexture *iface);
 
 HRESULT d3drm_texture_create(struct d3drm_texture **texture, IDirect3DRM *d3drm);
 HRESULT d3drm_frame_create(struct d3drm_frame **frame, IUnknown *parent_frame, IDirect3DRM *d3drm);

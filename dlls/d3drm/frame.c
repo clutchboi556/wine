@@ -3159,6 +3159,15 @@ struct d3drm_frame *unsafe_impl_from_IDirect3DRMFrame(IDirect3DRMFrame *iface)
     return impl_from_IDirect3DRMFrame(iface);
 }
 
+struct d3drm_frame *unsafe_impl_from_IDirect3DRMFrame2(IDirect3DRMFrame2 *iface)
+{
+    if (!iface)
+        return NULL;
+    assert(iface->lpVtbl == &d3drm_frame2_vtbl);
+
+    return impl_from_IDirect3DRMFrame2(iface);
+}
+
 HRESULT d3drm_frame_create(struct d3drm_frame **frame, IUnknown *parent_frame, IDirect3DRM *d3drm)
 {
     static const char classname[] = "Frame";

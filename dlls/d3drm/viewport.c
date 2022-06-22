@@ -470,18 +470,120 @@ static HRESULT WINAPI d3drm_viewport1_Clear(IDirect3DRMViewport *iface)
     return d3drm_viewport2_Clear(&viewport->IDirect3DRMViewport2_iface, D3DRMCLEAR_ALL);
 }
 
+static HRESULT create_surface_from_image(IDirectDraw *ddraw, D3DRMIMAGE *image, IDirectDrawSurface **out)
+{
+    IDirectDrawSurface *surface;
+    DDSURFACEDESC desc;
+    HRESULT hr;
+    HBITMAP bitmap;
+    HDC hdc, hdcImage;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT;
+    desc.ddsCaps.dwCaps = DDSCAPS_TEXTURE;
+    desc.dwWidth = image->width;
+    desc.dwHeight = image->height;
+    desc.lPitch = 3;
+
+    desc.ddpfPixelFormat.dwSize = sizeof(desc.ddpfPixelFormat);
+    desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
+
+    desc.ddpfPixelFormat.dwRGBBitCount = 16;
+    desc.ddpfPixelFormat.dwRBitMask = 0x00007c00;
+    desc.ddpfPixelFormat.dwGBitMask = 0x000003e0;
+    desc.ddpfPixelFormat.dwBBitMask = 0x0000001f;
+
+    hr = IDirectDraw_CreateSurface(ddraw, &desc, &surface, NULL);
+    if (FAILED(hr))
+        return hr;
+
+    bitmap = CreateBitmap(image->width, image->height, 1, 1, image->buffer1);
+    if(!bitmap)
+    {
+        ERR("Failed to create Bitmap\n");
+        IDirectDrawSurface_Release(surface);
+        return E_FAIL;
+    }
+
+    hdcImage = CreateCompatibleDC(NULL);
+    SelectObject(hdcImage, bitmap);
+
+    IDirectDrawSurface_GetDC(surface, &hdc);
+    BitBlt(hdc, 0, 0, image->width, image->height, hdcImage, 0, 0, SRCCOPY);
+    IDirectDrawSurface_ReleaseDC(surface, hdc);
+    DeleteDC(hdcImage);
+    DeleteObject(hdcImage);
+
+    *out = surface;
+
+    return hr;
+}
+
+static HRESULT viewport_render(struct d3drm_viewport *viewport, struct d3drm_frame *drmframe)
+{
+    HRESULT hr = S_OK;
+
+    if (drmframe->backgroundimage)
+    {
+        IDirect3DRMTexture *drmtexture;
+
+        hr = IUnknown_QueryInterface(drmframe->backgroundimage, &IID_IDirect3DRMTexture, (void**)&drmtexture);
+        if (hr == S_OK)
+        {
+            struct d3drm_texture *texture = unsafe_impl_from_IDirect3DRMTexture(drmtexture);
+            if (!texture)
+            {
+                FIXME("Unsupported IDirect3DRMTexture interface\n");
+                return D3DRM_OK;
+            }
+
+            if (!texture->surface)
+                hr = create_surface_from_image(viewport->device->ddraw, texture->image, &texture->surface);
+
+            hr = IDirectDrawSurface_Blt(viewport->device->render_target, NULL, texture->surface, NULL, DDBLT_WAIT, NULL);
+
+            IDirect3DRMTexture_Release(drmtexture);
+        }
+    }
+
+    return hr;
+}
+
 static HRESULT WINAPI d3drm_viewport2_Render(IDirect3DRMViewport2 *iface, IDirect3DRMFrame3 *frame)
 {
-    FIXME("iface %p, frame %p stub!\n", iface, frame);
+    struct d3drm_viewport *viewport = impl_from_IDirect3DRMViewport2(iface);
+    struct d3drm_frame *drmframe = unsafe_impl_from_IDirect3DRMFrame3(frame);
+    HRESULT hr;
 
-    return D3DRM_OK;
+    TRACE("iface %p, frame %p\n", iface, frame);
+
+    hr = viewport_render(viewport, drmframe);
+
+    return hr;
 }
 
 static HRESULT WINAPI d3drm_viewport1_Render(IDirect3DRMViewport *iface, IDirect3DRMFrame *frame)
 {
-    FIXME("iface %p, frame %p stub!\n", iface, frame);
+    IDirect3DRMFrame2 *frame2;
+    struct d3drm_viewport *viewport = impl_from_IDirect3DRMViewport(iface);
+    struct d3drm_frame *drmframe;
+    HRESULT hr;
 
-    return D3DRM_OK;
+    TRACE("iface %p, frame %p\n", iface, frame);
+
+    hr = IDirect3DRMFrame_QueryInterface(frame, &IID_IDirect3DRMFrame2, (void**)&frame2);
+    if(hr == S_OK)
+    {
+        drmframe = unsafe_impl_from_IDirect3DRMFrame2(frame2);
+        IDirect3DRMFrame2_Release(frame2);
+    }
+    else
+        drmframe = unsafe_impl_from_IDirect3DRMFrame(frame);
+
+    hr = viewport_render(viewport, drmframe);
+
+    return hr;
 }
 
 static HRESULT WINAPI d3drm_viewport2_SetFront(IDirect3DRMViewport2 *iface, D3DVALUE front)
