@@ -2508,9 +2508,20 @@ static ULONG WINAPI d3drm_mesh_Release(IDirect3DRMMesh *iface)
 static HRESULT WINAPI d3drm_mesh_Clone(IDirect3DRMMesh *iface,
         IUnknown *outer, REFIID iid, void **out)
 {
+    struct d3drm_mesh *mesh = impl_from_IDirect3DRMMesh(iface);
+    struct d3drm_mesh *meshout;
+    HRESULT hr;
+
     FIXME("iface %p, outer %p, iid %s, out %p stub!\n", iface, outer, debugstr_guid(iid), out);
 
-    return E_NOTIMPL;
+    hr = d3drm_mesh_create(&meshout, mesh->d3drm);
+    if (FAILED(hr))
+        return hr;
+
+    hr = IDirect3DRMMesh_QueryInterface(&meshout->IDirect3DRMMesh_iface, iid, out);
+    IDirect3DRMMesh_Release(&meshout->IDirect3DRMMesh_iface);
+
+    return hr;
 }
 
 static HRESULT WINAPI d3drm_mesh_AddDestroyCallback(IDirect3DRMMesh *iface,
