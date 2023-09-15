@@ -2715,7 +2715,7 @@ static HRESULT WINAPI d3drm_mesh_SetGroupMapping(IDirect3DRMMesh *iface, D3DRMGR
 {
     FIXME("iface %p, id %#lx, value %#lx stub!\n", iface, id, value);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT WINAPI d3drm_mesh_SetGroupQuality(IDirect3DRMMesh *iface, D3DRMGROUPINDEX id, D3DRMRENDERQUALITY value)
