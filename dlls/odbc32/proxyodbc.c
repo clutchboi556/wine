@@ -6025,9 +6025,16 @@ static SQLRETURN bind_parameter_win32( struct statement *stmt, SQLUSMALLINT para
 {
     value_type = map_type( stmt, TRUE, value_type );
     param_type = map_type( stmt, TRUE, param_type );
+
     if (stmt->hdr.win32_funcs->SQLBindParameter)
         return stmt->hdr.win32_funcs->SQLBindParameter( stmt->hdr.win32_handle, param, io_type, value_type,
                                                         param_type, size, digits, value, buflen, len );
+    else if(stmt->hdr.win32_funcs->SQLBindParam)
+    {
+        return stmt->hdr.win32_funcs->SQLBindParam( stmt->hdr.win32_handle, param, value_type, param_type,
+                                                 size, digits, value, len);
+    }
+
     return SQL_ERROR;
 }
 
