@@ -2012,3 +2012,8 @@ error:
         hr = MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
     return hr;
 }
+
+WINAPI HRESULT __wine_create_http_bytestream(const WCHAR *url, void **out)
+{
+    return create_http_bytestream(url, out);
+}
