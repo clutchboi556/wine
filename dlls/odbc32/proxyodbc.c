@@ -6884,7 +6884,13 @@ static SQLRETURN get_connect_attr_win32_w( struct connection *con, SQLINTEGER at
 {
     if (con->hdr.win32_funcs->SQLGetConnectAttrW)
         return con->hdr.win32_funcs->SQLGetConnectAttrW( con->hdr.win32_handle, attr, value, buflen, retlen );
-    if (con->hdr.win32_funcs->SQLGetConnectAttr) FIXME( "Unicode to ANSI conversion not handled\n" );
+    if (con->hdr.win32_funcs->SQLGetConnectAttr)
+    {
+        SQLRETURN ret = con->hdr.win32_funcs->SQLGetConnectAttr( con->hdr.win32_handle, attr, value, buflen, retlen );
+        if (ret == SQL_ERROR)
+            FIXME( "Unicode to ANSI conversion not handled\n" );
+        return ret;
+    }
     return SQL_ERROR;
 }
 
@@ -7050,7 +7056,12 @@ static SQLRETURN get_diag_field_win32_w( SQLSMALLINT type, struct object *obj, S
     if (obj->win32_funcs->SQLGetDiagFieldW)
         return obj->win32_funcs->SQLGetDiagFieldW( type, obj->win32_handle, rec_num, diag_id, diag_info, buflen,
                                                    retlen );
-    if (obj->win32_funcs->SQLGetDiagField) FIXME( "Unicode to ANSI conversion not handled\n" );
+    if (obj->win32_funcs->SQLGetDiagField)
+    {
+        FIXME( "Unicode to ANSI conversion not handled\n" );
+        return obj->win32_funcs->SQLGetDiagField( type, obj->win32_handle, rec_num, diag_id, diag_info, buflen,
+                                                           retlen );
+    }
     return SQL_ERROR;
 }
 
@@ -7307,7 +7318,13 @@ static SQLRETURN set_connect_attr_win32_w( struct connection *con, SQLINTEGER at
 {
     if (con->hdr.win32_funcs->SQLSetConnectAttrW)
         return con->hdr.win32_funcs->SQLSetConnectAttrW( con->hdr.win32_handle, attr, value, len );
-    if (con->hdr.win32_funcs->SQLSetConnectAttr) FIXME( "Unicode to ANSI conversion not handled\n" );
+    if (con->hdr.win32_funcs->SQLSetConnectAttr)
+    {
+        SQLRETURN ret = con->hdr.win32_funcs->SQLSetConnectAttr( con->hdr.win32_handle, attr, value, len );
+        if (ret == SQL_ERROR)
+            FIXME( "Unicode to ANSI conversion not handled\n" );
+        return ret;
+    }
     else if(con->hdr.win32_funcs->SQLSetConnectOptionW)
     {
         /* ODBC v2 */
@@ -8489,7 +8506,13 @@ static SQLRETURN set_desc_field_win32_w( struct descriptor *desc, SQLSMALLINT re
 {
     if (desc->hdr.win32_funcs->SQLSetDescFieldW)
         return desc->hdr.win32_funcs->SQLSetDescFieldW( desc->hdr.win32_handle, record, id, value, len );
-    if (desc->hdr.win32_funcs->SQLSetDescField) FIXME( "Unicode to ANSI conversion not handled\n" );
+    if (desc->hdr.win32_funcs->SQLSetDescField)
+    {
+        SQLRETURN ret = desc->hdr.win32_funcs->SQLSetDescField( desc->hdr.win32_handle, record, id, value, len );
+        if (ret == SQL_ERROR)
+            FIXME( "Unicode to ANSI conversion not handled (%d)\n", id );
+        return ret;
+    }
     return SQL_ERROR;
 }
 
