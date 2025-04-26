@@ -7236,7 +7236,8 @@ static SQLRETURN get_stmt_attr_win32_w( struct statement *stmt, SQLINTEGER attr,
 {
     if (stmt->hdr.win32_funcs->SQLGetStmtAttrW)
         return stmt->hdr.win32_funcs->SQLGetStmtAttrW( stmt->hdr.win32_handle, attr, value, buflen, retlen );
-    if (stmt->hdr.win32_funcs->SQLGetStmtAttr) FIXME( "Unicode to ANSI conversion not handled\n" );
+    if (stmt->hdr.win32_funcs->SQLGetStmtAttr)
+        return stmt->hdr.win32_funcs->SQLGetStmtAttr( stmt->hdr.win32_handle, attr, value, buflen, retlen );
     return SQL_ERROR;
 }
 
