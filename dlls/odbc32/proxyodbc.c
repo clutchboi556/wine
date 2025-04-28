@@ -5095,6 +5095,10 @@ static SQLRETURN col_attributes_unix_a( struct statement *stmt, SQLUSMALLINT col
     return ret;
 }
 
+static SQLRETURN col_attribute_win32_w( struct statement *stmt, SQLUSMALLINT col, SQLUSMALLINT field_id,
+                                        SQLPOINTER char_attr, SQLSMALLINT buflen, SQLSMALLINT *retlen,
+                                        SQLLEN *num_attr );
+
 static SQLRETURN col_attributes_win32_a( struct statement *stmt, SQLUSMALLINT col, SQLUSMALLINT field_id,
                                          SQLPOINTER char_attrs, SQLSMALLINT buflen, SQLSMALLINT *retlen,
                                          SQLLEN *num_attrs )
@@ -6291,11 +6295,17 @@ static SQLRETURN col_attributes_win32_w( struct statement *stmt, SQLUSMALLINT co
                                          SQLPOINTER char_attrs, SQLSMALLINT buflen, SQLSMALLINT *retlen,
                                          SQLLEN *num_attrs )
 {
+    SQLRETURN ret = SQL_ERROR;
+
     if (stmt->hdr.win32_funcs->SQLColAttributesW)
         return stmt->hdr.win32_funcs->SQLColAttributesW( stmt->hdr.win32_handle, col, field_id, char_attrs, buflen,
                                                          retlen, num_attrs );
     if (stmt->hdr.win32_funcs->SQLColAttributes) FIXME( "Unicode to ANSI conversion not handled\n" );
-    return SQL_ERROR;
+    else
+    {
+       ret = col_attribute_win32_w( stmt, col, field_id, char_attrs, buflen, retlen, num_attrs );
+    }
+    return ret;
 }
 
 /*************************************************************************
@@ -6778,8 +6788,34 @@ static SQLRETURN col_attribute_win32_w( struct statement *stmt, SQLUSMALLINT col
     }
     else if (stmt->hdr.win32_funcs->SQLColAttribute)
     {
-        FIXME( "Unicode to ANSI conversion not handled\n" );
-        return SQL_ERROR;
+        SQLCHAR *strA = char_attr;
+
+        if (char_attr && buflen && SQLColAttributes_KnownStringAttribute(field_id))
+        {
+            strA = malloc( buflen );
+        }
+
+        ret = stmt->hdr.win32_funcs->SQLColAttribute( stmt->hdr.win32_handle, col, field_id, strA, buflen,
+                                                         retlen, num_attr );
+        if (ret == SQL_SUCCESS && SQLColAttributes_KnownStringAttribute(field_id))
+        {
+            if (strA)
+            {
+                WCHAR *p = strnAtoW(strA, -1);
+                wcscpy(char_attr, p);
+                free(p);
+
+                if (retlen)
+                    *retlen = wcslen( char_attr ) * sizeof(WCHAR);
+            }
+            else if (retlen)
+                *retlen = *retlen * sizeof(WCHAR);
+        }
+
+        if (strA != char_attr)
+            free(strA);
+
+        return ret;
     }
     else if (stmt->hdr.win32_funcs->SQLColAttributesW)
     {
