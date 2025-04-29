@@ -6817,7 +6817,8 @@ static SQLRETURN col_attribute_win32_w( struct statement *stmt, SQLUSMALLINT col
 
         return ret;
     }
-    else if (stmt->hdr.win32_funcs->SQLColAttributesW)
+
+    if (stmt->hdr.win32_funcs->SQLColAttributesW || stmt->hdr.win32_funcs->SQLColAttributes)
     {
         if (buflen < 0) return SQL_ERROR;
         if (!col)
@@ -6866,8 +6867,42 @@ static SQLRETURN col_attribute_win32_w( struct statement *stmt, SQLUSMALLINT col
             FIXME( "field id %u not handled\n", field_id );
         }
 
-        ret = stmt->hdr.win32_funcs->SQLColAttributesW( stmt->hdr.win32_handle, col, field_id, char_attr, buflen,
+        if (stmt->hdr.win32_funcs->SQLColAttributes)
+        {
+            SQLCHAR *strA = char_attr;
+
+            if (char_attr && buflen && SQLColAttributes_KnownStringAttribute(field_id))
+            {
+                strA = malloc( buflen );
+            }
+
+            ret = stmt->hdr.win32_funcs->SQLColAttributes( stmt->hdr.win32_handle, col, field_id, strA, buflen,
+                    retlen, num_attr );
+
+            if (ret == SQL_SUCCESS && SQLColAttributes_KnownStringAttribute(field_id) )
+            {
+                if (strA)
+                {
+                    WCHAR *p = strnAtoW(strA, -1);
+                    wcscpy(char_attr, p);
+                    free(p);
+
+                    if (retlen)
+                        *retlen = wcslen( char_attr ) * sizeof(WCHAR);
+                }
+                else if (retlen)
+                    *retlen = *retlen * sizeof(WCHAR);
+            }
+
+            if (strA != char_attr)
+                free(strA);
+
+        }
+        else
+        {
+            ret = stmt->hdr.win32_funcs->SQLColAttributesW( stmt->hdr.win32_handle, col, field_id, char_attr, buflen,
                                                          retlen, num_attr );
+        }
     }
 
     if (SUCCESS( ret ) && num_attr && field_id == SQL_COLUMN_TYPE)
