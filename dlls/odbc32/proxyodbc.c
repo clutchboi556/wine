@@ -7215,8 +7215,9 @@ static SQLRETURN get_diag_rec_win32_w( SQLSMALLINT type, struct object *obj, SQL
         return SQL_ERROR;
     }
 
-    if (obj->win32_funcs->SQLErrorW)
+    if (obj->win32_funcs->SQLErrorW || obj->win32_funcs->SQLError)
     {
+        SQLRETURN ret = SQL_ERROR;
         SQLHENV env = NULL;
         SQLHDBC con = NULL;
         SQLHSTMT stmt = NULL;
@@ -7241,7 +7242,27 @@ static SQLRETURN get_diag_rec_win32_w( SQLSMALLINT type, struct object *obj, SQL
             return SQL_ERROR;
         }
 
-        return obj->win32_funcs->SQLErrorW( env, con, stmt, state, native_err, msg, buflen, retlen );
+        if (obj->win32_funcs->SQLErrorW)
+            ret = obj->win32_funcs->SQLErrorW( env, con, stmt, state, native_err, msg, buflen, retlen );
+        else if (obj->win32_funcs->SQLError)
+        {
+            SQLCHAR stateA[6], *msgA = NULL;
+            SQLSMALLINT lenA;
+
+            if (!(msgA = malloc( buflen ))) return SQL_ERROR;
+            ret = obj->win32_funcs->SQLError( env, con, stmt, stateA, native_err, msgA, buflen, &lenA );
+            if (SUCCESS( ret ))
+            {
+                WCHAR *p = strnAtoW(msgA, lenA);
+                wcscpy(msg, p);
+                free(p);
+
+                MultiByteToWideChar( CP_ACP, 0, (const char *)stateA, 6, state, 12 );
+            }
+            free( msgA );
+
+        }
+        return ret;
     }
 
     return SQL_ERROR;
