@@ -864,10 +864,44 @@ static SQLRETURN bind_col_unix( struct statement *stmt, SQLUSMALLINT column, SQL
     }
 }
 
+static BOOL driver_ansi_only( const struct win32_funcs *funcs )
+{
+    BOOL ansi =  !( funcs->SQLBrowseConnectW || funcs->SQLColAttributeW || funcs->SQLColAttributesW ||
+        funcs->SQLColumnPrivilegesW || funcs->SQLColumnsW || funcs->SQLConnectW ||
+        funcs->SQLDescribeColW || funcs->SQLDriverConnectW || funcs->SQLErrorW ||
+        funcs->SQLExecDirectW || funcs->SQLGetConnectAttrW || funcs->SQLGetConnectOptionW ||
+        funcs->SQLGetCursorNameW || funcs->SQLGetDescFieldW || funcs->SQLGetDescRecW ||
+        funcs->SQLGetDiagFieldW || funcs->SQLGetDiagRecW || funcs->SQLGetInfoW ||
+        funcs->SQLGetStmtAttrW || funcs->SQLGetTypeInfoW || funcs->SQLNativeSqlW ||
+        funcs->SQLPrepareW || funcs->SQLPrimaryKeysW || funcs->SQLProceduresW ||
+        funcs->SQLSetConnectAttrW || funcs->SQLSetConnectOptionW || funcs->SQLSetCursorNameW ||
+        funcs->SQLSetDescFieldW || funcs->SQLSetStmtAttrW || funcs->SQLSpecialColumnsW ||
+        funcs->SQLStatisticsW || funcs->SQLTablePrivilegesW || funcs->SQLTablesW );
+
+    return ansi;
+}
+
 static SQLRETURN bind_col_win32( struct statement *stmt, SQLUSMALLINT column, SQLSMALLINT type, SQLPOINTER value,
                                  SQLLEN buflen, SQLLEN *retlen )
 {
     type = map_type( stmt, TRUE, type );
+
+    if ( driver_ansi_only(stmt->hdr.win32_funcs) )
+    {
+        UINT i = column - 1;
+        SQLSMALLINT orig_type = type;
+
+        /* For ANSI Drivers we need to remap to standard char binding to stop Fetch from causing an error */
+        if (type == SQL_C_WCHAR)
+            type = SQL_CHAR;
+
+         if (!alloc_binding( &stmt->bind_col, SQL_PARAM_INPUT_OUTPUT, column, stmt->row_count ))
+            return SQL_ERROR;
+
+        stmt->bind_col.param[i].col.target_type   = type;
+        stmt->bind_col.param[i].col.target_value  = value;
+        stmt->bind_col.param[i].col.buffer_length = orig_type;
+    }
 
     if (stmt->hdr.win32_funcs->SQLBindCol)
         return stmt->hdr.win32_funcs->SQLBindCol( stmt->hdr.win32_handle, column, type, value, buflen, retlen );
