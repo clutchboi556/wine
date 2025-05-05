@@ -2367,9 +2367,31 @@ static SQLRETURN fetch_unix( struct statement *stmt )
 
 static SQLRETURN fetch_win32( struct statement *stmt )
 {
+    SQLRETURN ret = SQL_ERROR;
+
     if (stmt->hdr.win32_funcs->SQLFetch)
-        return stmt->hdr.win32_funcs->SQLFetch( stmt->hdr.win32_handle );
-    return SQL_ERROR;
+    {
+        ret = stmt->hdr.win32_funcs->SQLFetch( stmt->hdr.win32_handle );
+
+        if (driver_ansi_only(stmt->hdr.win32_funcs) && stmt->bind_col.param)
+        {
+            int i;
+
+            for (i = 0; i < stmt->bind_col.count; i++)
+            {
+                /* buffer_length currently used for Original Type */
+                if (stmt->bind_col.param[i].col.buffer_length == SQL_C_WCHAR &&
+                        stmt->bind_col.param[i].col.target_type != stmt->bind_col.param[i].col.buffer_length)
+                {
+                    WCHAR *str = strnAtoW(stmt->bind_col.param[i].col.target_value, -1);
+                    wcscpy(stmt->bind_col.param[i].col.target_value, str);
+                    free(str);
+                }
+            }
+        }
+    }
+
+    return ret;
 }
 
 /*************************************************************************
