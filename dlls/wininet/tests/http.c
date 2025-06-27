@@ -3154,6 +3154,11 @@ static void test_proxy_direct(int port)
     hr = HttpOpenRequestA(hc, NULL, "/test2", NULL, NULL, NULL, 0, 0);
     ok(hr != NULL, "HttpOpenRequest failed\n");
 
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_PROXY_PASSWORD, NULL, NULL);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+
     sz = 0;
     SetLastError(0xdeadbeef);
     r = InternetQueryOptionA(hr, INTERNET_OPTION_PROXY_PASSWORD, NULL, &sz);
@@ -3161,7 +3166,26 @@ static void test_proxy_direct(int port)
     ok(!r, "unexpected success\n");
     ok(sz == 1, "got %lu\n", sz);
 
+    sz = 0xbeef;
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_PROXY_PASSWORD, NULL, &sz);
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+    ok(sz == 1, "got %lu\n", sz);
+
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_PROXY_USERNAME, NULL, NULL);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+
     sz = 0;
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_PROXY_USERNAME, NULL, &sz);
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+    ok(sz == 1, "got %lu\n", sz);
+
+    sz = 0xbeef;
     SetLastError(0xdeadbeef);
     r = InternetQueryOptionA(hr, INTERNET_OPTION_PROXY_USERNAME, NULL, &sz);
     ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
@@ -3180,6 +3204,11 @@ static void test_proxy_direct(int port)
     ok(r, "unexpected failure %lu\n", GetLastError());
     ok(!sz, "got %lu\n", sz);
 
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_PASSWORD, NULL, NULL);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+
     sz = 0;
     SetLastError(0xdeadbeef);
     r = InternetQueryOptionA(hr, INTERNET_OPTION_PASSWORD, NULL, &sz);
@@ -3187,7 +3216,26 @@ static void test_proxy_direct(int port)
     ok(!r, "unexpected success\n");
     ok(sz == 1, "got %lu\n", sz);
 
+    sz = 0xbeef;
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_PASSWORD, NULL, &sz);
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+    ok(sz == 1, "got %lu\n", sz);
+
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_USERNAME, NULL, NULL);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+
     sz = 0;
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_USERNAME, NULL, &sz);
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+    ok(sz == 1, "got %lu\n", sz);
+
+    sz = 0xbeef;
     SetLastError(0xdeadbeef);
     r = InternetQueryOptionA(hr, INTERNET_OPTION_USERNAME, NULL, &sz);
     ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
@@ -3206,7 +3254,19 @@ static void test_proxy_direct(int port)
     ok(r, "unexpected failure %lu\n", GetLastError());
     ok(!sz, "got %lu\n", sz);
 
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_URL, NULL, NULL);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+
     sz = 0;
+    SetLastError(0xdeadbeef);
+    r = InternetQueryOptionA(hr, INTERNET_OPTION_URL, NULL, &sz);
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
+    ok(!r, "unexpected success\n");
+    ok(sz == 34, "got %lu\n", sz);
+
+    sz = 0xbeef;
     SetLastError(0xdeadbeef);
     r = InternetQueryOptionA(hr, INTERNET_OPTION_URL, NULL, &sz);
     ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got %lu\n", GetLastError());
