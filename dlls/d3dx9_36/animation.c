@@ -29,8 +29,13 @@ struct d3dx9_animation_controller
     LONG ref;
 
     UINT max_outputs;
+
+    ID3DXAnimationSet **animation_sets;
+    UINT num_sets;
     UINT max_sets;
+
     UINT max_tracks;
+
     UINT max_events;
 };
 
@@ -75,6 +80,14 @@ static ULONG WINAPI d3dx9_animation_controller_Release(ID3DXAnimationController 
 
     if (!refcount)
     {
+        unsigned int i;
+
+        for (i = 0; i < animation->max_sets; i++)
+        {
+            if (animation->animation_sets[i])
+                animation->animation_sets[i]->lpVtbl->Release(animation->animation_sets[i]);
+        }
+        free(animation->animation_sets);
         free(animation);
     }
 
@@ -129,9 +142,17 @@ static HRESULT WINAPI d3dx9_animation_controller_RegisterAnimationOutput(ID3DXAn
 static HRESULT WINAPI d3dx9_animation_controller_RegisterAnimationSet(ID3DXAnimationController *iface,
         ID3DXAnimationSet *anim_set)
 {
+    struct d3dx9_animation_controller *animation = impl_from_ID3DXAnimationController(iface);
+
     FIXME("iface %p, anim_set %p stub.\n", iface, anim_set);
 
-    return E_NOTIMPL;
+    if (!anim_set || animation->num_sets >= animation->max_sets)
+        return D3DERR_INVALIDCALL;
+
+    animation->animation_sets[animation->num_sets++] = anim_set;
+    anim_set->lpVtbl->AddRef(anim_set);
+
+    return D3D_OK;
 }
 
 static HRESULT WINAPI d3dx9_animation_controller_UnregisterAnimationSet(ID3DXAnimationController *iface,
@@ -144,9 +165,11 @@ static HRESULT WINAPI d3dx9_animation_controller_UnregisterAnimationSet(ID3DXAni
 
 static UINT WINAPI d3dx9_animation_controller_GetNumAnimationSets(ID3DXAnimationController *iface)
 {
+    struct d3dx9_animation_controller *animation = impl_from_ID3DXAnimationController(iface);
+
     FIXME("iface %p stub.\n", iface);
 
-    return 0;
+    return animation->num_sets;
 }
 
 static HRESULT WINAPI d3dx9_animation_controller_GetAnimationSet(ID3DXAnimationController *iface,
@@ -459,6 +482,13 @@ HRESULT WINAPI D3DXCreateAnimationController(UINT max_outputs, UINT max_sets,
     object->ID3DXAnimationController_iface.lpVtbl = &d3dx9_animation_controller_vtbl;
     object->ref = 1;
     object->max_outputs = max_outputs;
+
+    object->animation_sets = calloc(max_sets, sizeof(*object->animation_sets));
+    if (!object->animation_sets)
+    {
+        free(object);
+        return E_OUTOFMEMORY;
+    }
     object->max_sets    = max_sets;
     object->max_tracks  = max_tracks;
     object->max_events  = max_events;
