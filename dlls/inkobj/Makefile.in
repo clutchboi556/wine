@@ -1,5 +1,4 @@
 MODULE    = inkobj.dll
-IMPORTS   = uuid
 
 SOURCES = \
 	inkobj.c \
