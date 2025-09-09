@@ -1,4 +1,6 @@
 MODULE    = inkobj.dll
+IMPORTS   = uuid
 
 SOURCES = \
-	inkobj.c
+	inkobj.c \
+	inkobj.idl
