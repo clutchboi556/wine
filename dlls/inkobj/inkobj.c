@@ -307,7 +307,7 @@ static HRESULT WINAPI inkdisp_CreateStroke(IInkDisp *iface, VARIANT data, VARIAN
 }
 
 static HRESULT WINAPI inkdisp_ClipboardCopyWithRectangle(IInkDisp *iface, IInkRectangle *Rectangle, InkClipboardFormats ClipboardFormats,
-    InkClipboardModes ClipboardModes, IDataObject **DataObject)
+    InkClipboardModes ClipboardModes, /*IDataObject*/ IUnknown **DataObject)
 {
     struct ink_disp *ink_disp = impl_from_IInkDisp( iface );
 
@@ -317,7 +317,7 @@ static HRESULT WINAPI inkdisp_ClipboardCopyWithRectangle(IInkDisp *iface, IInkRe
 }
 
 static HRESULT WINAPI inkdisp_ClipboardCopy(IInkDisp *iface, IInkStrokes *strokes, InkClipboardFormats ClipboardFormats,
-    InkClipboardModes ClipboardModes, IDataObject **DataObject)
+    InkClipboardModes ClipboardModes, /*IDataObject*/ IUnknown **DataObject)
 {
     struct ink_disp *ink_disp = impl_from_IInkDisp( iface );
 
@@ -326,7 +326,7 @@ static HRESULT WINAPI inkdisp_ClipboardCopy(IInkDisp *iface, IInkStrokes *stroke
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI inkdisp_CanPaste(IInkDisp *iface, IDataObject *DataObject, VARIANT_BOOL *CanPaste)
+static HRESULT WINAPI inkdisp_CanPaste(IInkDisp *iface, /*IDataObject*/ IUnknown *DataObject, VARIANT_BOOL *CanPaste)
 {
     struct ink_disp *ink_disp = impl_from_IInkDisp( iface );
 
@@ -335,7 +335,7 @@ static HRESULT WINAPI inkdisp_CanPaste(IInkDisp *iface, IDataObject *DataObject,
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI inkdisp_ClipboardPaste(IInkDisp *iface, LONG x, LONG y, IDataObject *DataObject, IInkStrokes **Strokes)
+static HRESULT WINAPI inkdisp_ClipboardPaste(IInkDisp *iface, LONG x, LONG y, /*IDataObject*/ IUnknown *DataObject, IInkStrokes **Strokes)
 {
     struct ink_disp *ink_disp = impl_from_IInkDisp( iface );
 
