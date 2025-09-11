@@ -4459,20 +4459,46 @@ static HRESULT WINAPI d3dx_effect_SetRawValue(ID3DXEffect *iface, D3DXHANDLE par
         {
             uint8_t *dst_data;
 
-            if (param->columns != 4)
+            if (param->columns == 4)
             {
-                FIXME("Vec%u parameters are currently unsupported.\n", param->columns);
-                return E_NOTIMPL;
+                if ((byte_offset + bytes) > param->bytes)
+                {
+                    FIXME("Writing adjacent parameters is currently unsupported.\n");
+                    return E_NOTIMPL;
+                }
+
+                dst_data = param_get_data_and_dirtify(effect, param, !byte_offset ? bytes : param->bytes, TRUE);
+                memcpy(dst_data + byte_offset, data, bytes);
+            }
+            else
+            {
+                unsigned int src_elems = (bytes + 0xf) / sizeof(D3DXVECTOR4);
+                unsigned int dst_stride = sizeof(float) * param->columns;
+                unsigned int dst_elems = max(1, param->element_count);
+                const D3DXVECTOR4 *src_data = data;
+                unsigned int i, bytes_left;
+
+                if (byte_offset)
+                {
+                    FIXME("Setting Vec%u parameters with an offset is currently unsupported.\n", param->columns);
+                    return E_NOTIMPL;
+                }
+
+                if (src_elems > dst_elems)
+                {
+                    FIXME("Writing adjacent parameters is currently unsupported.\n");
+                    return E_NOTIMPL;
+                }
+
+                bytes_left = bytes;
+                dst_data = param_get_data_and_dirtify(effect, param, dst_elems * dst_stride, TRUE);
+                for (i = 0; i < src_elems; ++i)
+                {
+                    memcpy(dst_data + (i * dst_stride), &src_data[i], min(bytes_left, dst_stride));
+                    bytes_left -= sizeof(*src_data);
+                }
             }
 
-            if ((byte_offset + bytes) > param->bytes)
-            {
-                FIXME("Writing adjacent parameters is currently unsupported.\n");
-                return E_NOTIMPL;
-            }
-
-            dst_data = param_get_data_and_dirtify(effect, param, !byte_offset ? bytes : param->bytes, TRUE);
-            memcpy(dst_data + byte_offset, data, bytes);
             break;
         }
 
