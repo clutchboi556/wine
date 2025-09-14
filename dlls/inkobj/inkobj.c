@@ -482,15 +482,16 @@ static HRESULT WINAPI inkoverlay_put_hWnd(IInkOverlay *iface, LONG_PTR window)
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI inkoverlay_get_Enabled( IInkOverlay *iface, VARIANT_BOOL *Collecting)
+static HRESULT WINAPI inkoverlay_get_Enabled( IInkOverlay *iface, VARIANT_BOOL *enabled)
 {
     struct inkoverlay *inkoverlay = impl_from_IInkOverlay( iface );
 
     FIXME("%p\n", inkoverlay);
-    return E_NOTIMPL;
+    *enabled = VARIANT_FALSE;
+    return S_OK;
 }
 
-static HRESULT WINAPI inkoverlay_put_Enabled(IInkOverlay *iface, VARIANT_BOOL Collecting)
+static HRESULT WINAPI inkoverlay_put_Enabled(IInkOverlay *iface, VARIANT_BOOL enabled)
 {
     struct inkoverlay *inkoverlay = impl_from_IInkOverlay( iface );
 
@@ -535,6 +536,7 @@ static HRESULT WINAPI inkoverlay_get_Ink(IInkOverlay *iface, IInkDisp **Ink)
     struct inkoverlay *inkoverlay = impl_from_IInkOverlay( iface );
 
     FIXME("%p\n", inkoverlay);
+    *Ink = NULL;
     return E_NOTIMPL;
 }
 
@@ -567,7 +569,9 @@ static HRESULT WINAPI inkoverlay_get_CollectingInk(IInkOverlay *iface, VARIANT_B
     struct inkoverlay *inkoverlay = impl_from_IInkOverlay( iface );
 
     FIXME("%p\n", inkoverlay);
-    return E_NOTIMPL;
+
+    *collecting = VARIANT_FALSE;
+    return S_OK;
 }
 
 static HRESULT WINAPI inkoverlay_get_CollectionMode( IInkOverlay *iface, InkCollectionMode *mode)
