@@ -4533,6 +4533,54 @@ static HRESULT WINAPI d3dx_effect_SetRawValue(ID3DXEffect *iface, D3DXHANDLE par
             break;
         }
 
+        case D3DXPC_STRUCT:
+        {
+            const uint8_t *cur_param_data = data;
+            UINT bytes_left = bytes;
+            unsigned int i;
+            HRESULT hr;
+
+            if (byte_offset)
+            {
+                FIXME("Setting structure members at an offset is currently unsupported.\n");
+                return E_NOTIMPL;
+            }
+
+            for (i = 0; i < param->member_count; ++i)
+            {
+                UINT member_size = param->members[i].class == D3DXPC_MATRIX_ROWS ? 64 : 16;
+                unsigned int member_elems = max(1, param->members[i].element_count);
+                struct d3dx_parameter *member = &param->members[i];
+
+                if (member->class != D3DXPC_MATRIX_ROWS && member->class != D3DXPC_VECTOR)
+                {
+                    FIXME("Unhandled structure member parameter class %s.\n", debug_d3dxparameter_class(member->class));
+                    return E_NOTIMPL;
+                }
+
+                member_size *= member_elems;
+                hr = iface->lpVtbl->SetRawValue(iface, (D3DXHANDLE)member, (const void *)cur_param_data, 0,
+                        min(member_size, bytes_left));
+                if (FAILED(hr))
+                {
+                    WARN("Failed with hr %#lx.\n", hr);
+                    return hr;
+                }
+
+                if (bytes_left <= member_size)
+                {
+                    bytes_left = 0;
+                    break;
+                }
+                cur_param_data += member_size;
+                bytes_left -= member_size;
+            }
+
+            if (bytes_left)
+                FIXME("%u bytes were leftover, might have attempted to write an adjacent parameter.\n", bytes_left);
+            break;
+        }
+
         default:
             FIXME("Unhandled parameter class %s.\n", debug_d3dxparameter_class(param->class));
             return E_NOTIMPL;
