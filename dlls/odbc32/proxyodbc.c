@@ -2966,6 +2966,7 @@ static SQLRETURN get_desc_field_win32_a( struct descriptor *desc, SQLSMALLINT re
     SQLRETURN ret = SQL_ERROR;
     SQLPOINTER val = value;
     SQLWCHAR *strW = NULL;
+    SQLINTEGER buffer_len = buflen;
 
     if (desc->hdr.win32_funcs->SQLGetDescField)
         return desc->hdr.win32_funcs->SQLGetDescField( desc->hdr.win32_handle, record, field_id, value, buflen, retlen );
@@ -2985,11 +2986,12 @@ static SQLRETURN get_desc_field_win32_a( struct descriptor *desc, SQLSMALLINT re
         case SQL_DESC_SCHEMA_NAME:
         case SQL_DESC_TABLE_NAME:
         case SQL_DESC_TYPE_NAME:
-            if (!(val = strW = malloc( buflen * sizeof(WCHAR) ))) return SQL_ERROR;
+            buffer_len = buflen * sizeof(WCHAR);
+            if (!(val = strW = malloc( buffer_len ))) return SQL_ERROR;
         default: break;
         }
 
-        ret = desc->hdr.win32_funcs->SQLGetDescFieldW( desc->hdr.win32_handle, record, field_id, value, buflen, retlen );
+        ret = desc->hdr.win32_funcs->SQLGetDescFieldW( desc->hdr.win32_handle, record, field_id, val, buffer_len, retlen );
         if (SUCCESS( ret ) && strW)
         {
             int len = WideCharToMultiByte( CP_ACP, 0, strW, -1, (char *)value, buflen, NULL, NULL );
