@@ -928,7 +928,8 @@ static void shader_print_operand(struct vkd3d_d3d_asm_compiler *compiler, const 
 
             if (reg->idx[0].rel_addr || reg->type == VSIR_REGISTER_IMMCONSTBUFFER
                     || reg->type == VSIR_REGISTER_INCONTROLPOINT || reg->type == VSIR_REGISTER_OUTCONTROLPOINT
-                    || (reg->type == VSIR_REGISTER_INPUT && (compiler->shader_version.type == VKD3D_SHADER_TYPE_GEOMETRY
+                    || reg->type == VSIR_REGISTER_THIS || (reg->type == VSIR_REGISTER_INPUT
+                    && (compiler->shader_version.type == VKD3D_SHADER_TYPE_GEOMETRY
                     || compiler->shader_version.type == VKD3D_SHADER_TYPE_HULL)))
             {
                 vkd3d_string_buffer_printf(buffer, "%s", compiler->colours.reset);
@@ -2293,6 +2294,7 @@ static void shader_print_io_declaration(struct vkd3d_string_buffer *buffer, enum
         X(OUTCONTROLPOINT)
         X(PATCHCONST)
         X(TESSCOORD)
+        X(THIS)
         X(GROUPSHAREDMEM)
         X(THREADID)
         X(THREADGROUPID)

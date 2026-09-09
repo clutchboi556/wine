@@ -6354,11 +6354,11 @@ static struct hlsl_ir_node *lower_resource_load_bias(struct hlsl_ctx *ctx,
 static struct hlsl_ir_node *lower_comparison_operators(struct hlsl_ctx *ctx, struct hlsl_ir_node *instr,
         struct hlsl_block *block)
 {
-    struct hlsl_ir_node *arg1, *arg1_cast, *arg2, *arg2_cast, *slt, *res;
+    struct hlsl_ir_node *arg1, *arg1_cast, *arg2, *arg2_cast, *res;
+    struct hlsl_constant_value zero_value, one_value;
     struct hlsl_ir_node *operands[HLSL_MAX_OPERANDS];
     struct hlsl_type *float_type;
     struct hlsl_ir_expr *expr;
-    bool negate = false;
 
     if (instr->type != HLSL_IR_EXPR)
         return NULL;
@@ -6373,64 +6373,117 @@ static struct hlsl_ir_node *lower_comparison_operators(struct hlsl_ctx *ctx, str
     arg1_cast = hlsl_block_add_cast(ctx, block, arg1, float_type, &instr->loc);
     arg2_cast = hlsl_block_add_cast(ctx, block, arg2, float_type, &instr->loc);
 
-    switch (expr->op)
+    zero_value.u[0].f = 0.0f;
+    zero_value.u[1].f = 0.0f;
+    zero_value.u[2].f = 0.0f;
+    zero_value.u[3].f = 0.0f;
+    one_value.u[0].f = 1.0f;
+    one_value.u[1].f = 1.0f;
+    one_value.u[2].f = 1.0f;
+    one_value.u[3].f = 1.0f;
+
+    if (ctx->profile->type == VKD3D_SHADER_TYPE_VERTEX)
     {
-        case HLSL_OP2_EQUAL:
-        case HLSL_OP2_NEQUAL:
+        struct hlsl_ir_node *slt;
+        bool negate = false;
+
+        switch (expr->op)
         {
-            struct hlsl_ir_node *neg, *sub, *abs, *abs_neg;
-
-            neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, arg2_cast, &instr->loc);
-            sub = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_ADD, arg1_cast, neg);
-
-            if (ctx->profile->major_version >= 3)
+            case HLSL_OP2_EQUAL:
+            case HLSL_OP2_NEQUAL:
             {
-                abs = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_ABS, sub, &instr->loc);
-            }
-            else
-            {
-                /* Use MUL as a precarious ABS. */
-                abs = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_MUL, sub, sub);
+                struct hlsl_ir_node *neg, *sub, *abs, *abs_neg;
+
+                neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, arg2_cast, &instr->loc);
+                sub = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_ADD, arg1_cast, neg);
+
+                /* SM2 uses MUL as a precarious ABS. */
+                if (ctx->profile->major_version < 3)
+                    abs = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_MUL, sub, sub);
+                else
+                    abs = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_ABS, sub, &instr->loc);
+                abs_neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, abs, &instr->loc);
+                slt = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_SLT, abs_neg, abs);
+                negate = (expr->op == HLSL_OP2_EQUAL);
+
+                break;
             }
 
-            abs_neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, abs, &instr->loc);
-            slt = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_SLT, abs_neg, abs);
-            negate = (expr->op == HLSL_OP2_EQUAL);
-            break;
+            case HLSL_OP2_GEQUAL:
+            case HLSL_OP2_LESS:
+            {
+                slt = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_SLT, arg1_cast, arg2_cast);
+                negate = (expr->op == HLSL_OP2_GEQUAL);
+                break;
+            }
+
+            default:
+                vkd3d_unreachable();
         }
 
-        case HLSL_OP2_GEQUAL:
-        case HLSL_OP2_LESS:
+        if (negate)
         {
-            slt = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_SLT, arg1_cast, arg2_cast);
-            negate = (expr->op == HLSL_OP2_GEQUAL);
-            break;
+            struct hlsl_ir_node *one, *slt_neg;
+
+            one = hlsl_block_add_constant(ctx, block, float_type, &one_value, &instr->loc);
+            slt_neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, slt, &instr->loc);
+            res = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_ADD, one, slt_neg);
         }
-
-        default:
-            vkd3d_unreachable();
-    }
-
-    if (negate)
-    {
-        struct hlsl_constant_value one_value;
-        struct hlsl_ir_node *one, *slt_neg;
-
-        one_value.u[0].f = 1.0;
-        one_value.u[1].f = 1.0;
-        one_value.u[2].f = 1.0;
-        one_value.u[3].f = 1.0;
-        one = hlsl_block_add_constant(ctx, block, float_type, &one_value, &instr->loc);
-        slt_neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, slt, &instr->loc);
-        res = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_ADD, one, slt_neg);
+        else
+        {
+            res = slt;
+        }
     }
     else
     {
-        res = slt;
+        struct hlsl_ir_node *neg, *sub, *one, *zero;
+
+        one = hlsl_block_add_constant(ctx, block, float_type, &one_value, &instr->loc);
+        zero = hlsl_block_add_constant(ctx, block, float_type, &zero_value, &instr->loc);
+        neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, arg2_cast, &instr->loc);
+        sub = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_ADD, arg1_cast, neg);
+
+        switch (expr->op)
+        {
+            case HLSL_OP2_EQUAL:
+            case HLSL_OP2_NEQUAL:
+            {
+                struct hlsl_ir_node *abs, *abs_neg;
+
+                /* SM2 uses MUL as a precarious ABS. */
+                if (ctx->profile->major_version < 3)
+                    abs = hlsl_block_add_binary_expr(ctx, block, HLSL_OP2_MUL, sub, sub);
+                else
+                    abs = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_ABS, sub, &instr->loc);
+                abs_neg = hlsl_block_add_unary_expr(ctx, block, HLSL_OP1_NEG, abs, &instr->loc);
+                if (expr->op == HLSL_OP2_EQUAL)
+                    res = hlsl_block_add_ternary_expr(ctx, block, HLSL_OP3_CMP, abs_neg, one, zero);
+                else
+                    res = hlsl_block_add_ternary_expr(ctx, block, HLSL_OP3_CMP, abs_neg, zero, one);
+
+                break;
+            }
+
+            case HLSL_OP2_GEQUAL:
+            {
+                res = hlsl_block_add_ternary_expr(ctx, block, HLSL_OP3_CMP, sub, one, zero);
+                break;
+            }
+
+            case HLSL_OP2_LESS:
+            {
+                res = hlsl_block_add_ternary_expr(ctx, block, HLSL_OP3_CMP, sub, zero, one);
+                break;
+            }
+
+            default:
+                vkd3d_unreachable();
+        }
     }
 
-    /* We need a REINTERPRET so that the HLSL IR code is valid. SLT and its arguments must be FLOAT,
-     * and casts to BOOL have already been lowered to "!= 0". */
+    /* We need a REINTERPRET so that the HLSL IR code is valid. SLT, CMP, and
+     * their arguments must be FLOAT, and casts to BOOL have already been
+     * lowered to "!= 0". */
     memset(operands, 0, sizeof(operands));
     operands[0] = res;
     return hlsl_block_add_expr(ctx, block, HLSL_OP1_REINTERPRET, operands, instr->data_type, &instr->loc);
@@ -9980,8 +10033,9 @@ static struct hlsl_ir_node *fold_unary_identities(struct hlsl_ctx *ctx,
 
         case HLSL_OP1_CEIL:
         case HLSL_OP1_FLOOR:
-            /* f(g(x)) -> g(x), where f(), g() are floor() or ceil() functions. */
-            if (x->op == HLSL_OP1_CEIL || x->op == HLSL_OP1_FLOOR)
+        case HLSL_OP1_TRUNC:
+            /* f(g(x)) -> g(x), where f(), g() are floor(), ceil(), or trunc() functions. */
+            if (x->op == HLSL_OP1_CEIL || x->op == HLSL_OP1_FLOOR || x->op == HLSL_OP1_TRUNC)
                 return &x->node;
             break;
 
@@ -16834,7 +16888,9 @@ static void process_entry_function(struct hlsl_ctx *ctx, struct vsir_program *pr
         replace_ir(ctx, lower_casts_to_bool, body);
 
         replace_ir(ctx, lower_casts_to_int, body);
+        replace_ir(ctx, fold_unary_identities, body);
         replace_ir(ctx, lower_trunc, body);
+
         replace_ir(ctx, lower_sqrt, body);
         replace_ir(ctx, lower_dot, body);
         replace_ir(ctx, lower_round, body);
