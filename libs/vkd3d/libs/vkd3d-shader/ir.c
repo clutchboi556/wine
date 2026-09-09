@@ -171,6 +171,7 @@ const char *vsir_register_type_get_name(enum vsir_register_type type, const char
         [VSIR_REGISTER_TESSCOORD         ] = "vDomainLocation",
         [VSIR_REGISTER_TEXCRDOUT         ] = "oT",
         [VSIR_REGISTER_TEXTURE           ] = "t",
+        [VSIR_REGISTER_THIS              ] = "this",
         [VSIR_REGISTER_THREADGROUPID     ] = "vThreadGroupID",
         [VSIR_REGISTER_THREADID          ] = "vThreadID",
         [VSIR_REGISTER_UAV               ] = "u",
@@ -16716,6 +16717,7 @@ static bool is_read_only(const struct vsir_program *program, enum vsir_register_
         case VSIR_REGISTER_SAMPLER:
         case VSIR_REGISTER_SSA:
         case VSIR_REGISTER_TESSCOORD:
+        case VSIR_REGISTER_THIS:
         case VSIR_REGISTER_THREADGROUPID:
         case VSIR_REGISTER_THREADID:
         case VSIR_REGISTER_UNDEF:
@@ -16983,6 +16985,7 @@ static bool is_write_only(enum vsir_register_type type)
         case VSIR_REGISTER_SSA:
         case VSIR_REGISTER_STREAM:
         case VSIR_REGISTER_TESSCOORD:
+        case VSIR_REGISTER_THIS:
         case VSIR_REGISTER_THREADGROUPID:
         case VSIR_REGISTER_THREADID:
         case VSIR_REGISTER_TYPE_COUNT:
