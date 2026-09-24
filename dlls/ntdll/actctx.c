@@ -589,6 +589,7 @@ struct actctx_loader
     struct assembly_identity *dependencies;
     unsigned int              num_dependencies;
     unsigned int              allocated_dependencies;
+    WCHAR                    *private_path;  /* <probing privatePath> from the application config */
 };
 
 static const xmlstr_t empty_xmlstr;
@@ -3264,6 +3265,185 @@ static WCHAR *lookup_manifest_file( HANDLE dir, struct assembly_identity *ai )
     return ret;
 }
 
+static void parse_probing_elem( xmlbuf_t *xmlbuf, struct actctx_loader *acl, const struct xml_elem *parent )
+{
+    struct xml_attr attr;
+    BOOL end = FALSE;
+
+    while (next_xml_attr( xmlbuf, &attr, &end ))
+    {
+        if (xml_attr_cmp( &attr, L"privatePath" ))
+        {
+            RtlFreeHeap( GetProcessHeap(), 0, acl->private_path );
+            acl->private_path = xmlstrdupW( &attr.value );
+        }
+        else if (!is_xmlns_attr( &attr ))
+        {
+            WARN( "unknown attr %s\n", debugstr_xml_attr(&attr) );
+        }
+    }
+
+    if (!end) parse_expect_end_elem( xmlbuf, parent );
+}
+
+static void parse_config_assembly_binding_elem( xmlbuf_t *xmlbuf, struct actctx_loader *acl,
+                                                const struct xml_elem *parent )
+{
+    struct xml_elem elem;
+    struct xml_attr attr;
+    BOOL end = FALSE;
+
+    while (next_xml_attr( xmlbuf, &attr, &end ));
+    if (end) return;
+
+    while (next_xml_elem( xmlbuf, &elem, parent ))
+    {
+        if (xml_elem_cmp( &elem, L"probing", asmv1W ))
+            parse_probing_elem( xmlbuf, acl, &elem );
+        else
+            parse_unknown_elem( xmlbuf, &elem );
+    }
+}
+
+static void parse_config_windows_elem( xmlbuf_t *xmlbuf, struct actctx_loader *acl,
+                                       const struct xml_elem *parent )
+{
+    struct xml_elem elem;
+    struct xml_attr attr;
+    BOOL end = FALSE;
+
+    while (next_xml_attr( xmlbuf, &attr, &end ));
+    if (end) return;
+
+    while (next_xml_elem( xmlbuf, &elem, parent ))
+    {
+        if (xml_elem_cmp( &elem, L"assemblyBinding", asmv1W ))
+            parse_config_assembly_binding_elem( xmlbuf, acl, &elem );
+        else
+            parse_unknown_elem( xmlbuf, &elem );
+    }
+}
+
+/* Only <configuration><windows><assemblyBinding> matters to side-by-side; the
+ * <runtime> section of .NET configuration files is the CLR's business. */
+static BOOL parse_config_buffer( struct actctx_loader *acl, xmlbuf_t *xmlbuf )
+{
+    struct xml_elem elem, root, parent = {};
+    struct xml_attr attr;
+    BOOL end = FALSE;
+
+    xmlbuf->error = FALSE;
+    xmlbuf->ns_pos = 0;
+
+    if (!next_xml_elem( xmlbuf, &root, &parent )) return FALSE;
+    if (xmlstr_cmp( &root.name, L"?xml" ) &&
+        (!parse_xml_header( xmlbuf ) || !next_xml_elem( xmlbuf, &root, &parent )))
+        return FALSE;
+    if (!xml_elem_cmp( &root, L"configuration", L"" )) return FALSE;
+
+    while (next_xml_attr( xmlbuf, &attr, &end ));
+    if (end) return !xmlbuf->error;
+
+    while (next_xml_elem( xmlbuf, &elem, &root ))
+    {
+        if (xml_elem_cmp( &elem, L"windows", L"" ))
+            parse_config_windows_elem( xmlbuf, acl, &elem );
+        else
+            parse_unknown_elem( xmlbuf, &elem );
+    }
+    return !xmlbuf->error;
+}
+
+/* Read the application configuration file that goes with the root manifest:
+ * app.exe -> app.exe.config, app.exe.manifest -> app.exe.config */
+static void load_app_config( struct actctx_loader *acl )
+{
+    FILE_END_OF_FILE_INFORMATION info;
+    const WCHAR *manifest;
+    UNICODE_STRING nameW;
+    IO_STATUS_BLOCK io;
+    xmlbuf_t xmlbuf;
+    WCHAR *config, *text = NULL;
+    char *data = NULL;
+    HANDLE file;
+    SIZE_T len;
+    DWORD size;
+    int unicode_tests;
+
+    if (!acl->actctx->num_assemblies) return;
+    if (!(manifest = acl->actctx->assemblies[0].manifest.info)) return;
+
+    len = wcslen( manifest );
+    if (!(config = RtlAllocateHeap( GetProcessHeap(), 0, (len + 8) * sizeof(WCHAR) ))) return;
+    wcscpy( config, manifest );
+    if (len > 9 && !wcsicmp( config + len - 9, L".manifest" )) config[len - 9] = 0;
+    wcscat( config, L".config" );
+
+    if (!RtlDosPathNameToNtPathName_U( config, &nameW, NULL, NULL ))
+    {
+        RtlFreeHeap( GetProcessHeap(), 0, config );
+        return;
+    }
+    if (open_nt_file( &file, &nameW ))
+    {
+        RtlFreeUnicodeString( &nameW );
+        RtlFreeHeap( GetProcessHeap(), 0, config );
+        return;
+    }
+    RtlFreeUnicodeString( &nameW );
+
+    TRACE( "loading application configuration %s\n", debugstr_w(config) );
+
+    if (NtQueryInformationFile( file, &io, &info, sizeof(info), FileEndOfFileInformation ) ||
+        !info.EndOfFile.QuadPart || info.EndOfFile.QuadPart > 0x100000)
+        goto done;
+    size = info.EndOfFile.QuadPart;
+    if (!(data = RtlAllocateHeap( GetProcessHeap(), 0, size ))) goto done;
+    if (NtReadFile( file, 0, NULL, NULL, &io, data, size, NULL, NULL ) || io.Information != size)
+        goto done;
+
+    unicode_tests = IS_TEXT_UNICODE_SIGNATURE | IS_TEXT_UNICODE_REVERSE_SIGNATURE;
+    if (RtlIsTextUnicode( data, size, &unicode_tests ))
+    {
+        xmlbuf.ptr = (const WCHAR *)data;
+        xmlbuf.end = xmlbuf.ptr + size / sizeof(WCHAR);
+    }
+    else if (unicode_tests & IS_TEXT_UNICODE_REVERSE_SIGNATURE)
+    {
+        WCHAR *buf = (WCHAR *)data;
+        unsigned int i;
+
+        for (i = 0; i < size / sizeof(WCHAR); i++) buf[i] = RtlUshortByteSwap( buf[i] );
+        xmlbuf.ptr = buf;
+        xmlbuf.end = xmlbuf.ptr + size / sizeof(WCHAR);
+    }
+    else
+    {
+        DWORD text_len;
+
+        RtlUTF8ToUnicodeN( NULL, 0, &text_len, data, size );
+        if (!(text = RtlAllocateHeap( GetProcessHeap(), 0, text_len ))) goto done;
+        RtlUTF8ToUnicodeN( text, text_len, &text_len, data, size );
+        xmlbuf.ptr = text;
+        xmlbuf.end = xmlbuf.ptr + text_len / sizeof(WCHAR);
+    }
+
+    if (!parse_config_buffer( acl, &xmlbuf ))
+    {
+        WARN( "failed to parse application configuration %s\n", debugstr_w(config) );
+        RtlFreeHeap( GetProcessHeap(), 0, acl->private_path );
+        acl->private_path = NULL;
+    }
+    else if (acl->private_path)
+        TRACE( "privatePath %s\n", debugstr_w(acl->private_path) );
+
+done:
+    NtClose( file );
+    RtlFreeHeap( GetProcessHeap(), 0, text );
+    RtlFreeHeap( GetProcessHeap(), 0, data );
+    RtlFreeHeap( GetProcessHeap(), 0, config );
+}
+
 static NTSTATUS lookup_winsxs(struct actctx_loader* acl, struct assembly_identity* ai)
 {
     struct assembly_identity    sxs_ai;
@@ -3370,6 +3550,77 @@ done:
     return status;
 }
 
+/* A privatePath entry must name a subdirectory of the application directory. */
+static BOOL is_valid_private_path( const WCHAR *path, SIZE_T len )
+{
+    SIZE_T i, start = 0;
+
+    if (!len || path[0] == '\\' || path[0] == '/') return FALSE;
+    for (i = 0; i < len; i++) if (path[i] == ':') return FALSE;
+    for (i = 0; i <= len; i++)
+    {
+        if (i < len && path[i] != '\\' && path[i] != '/') continue;
+        if (i - start == 2 && path[start] == '.' && path[start + 1] == '.') return FALSE;
+        start = i + 1;
+    }
+    return TRUE;
+}
+
+/* Lookup in <appdir>\<privatePath>\name.dll, <appdir>\<privatePath>\name.manifest,
+ * <appdir>\<privatePath>\name\name.dll and <appdir>\<privatePath>\name\name.manifest
+ * for each ';'-separated privatePath entry of the application configuration file. */
+static NTSTATUS lookup_private_path( struct actctx_loader *acl, struct assembly_identity *ai,
+                                     const WCHAR *lang, const WCHAR *directory )
+{
+    const WCHAR *appdir = acl->actctx->appdir.info, *path, *next;
+    NTSTATUS status = STATUS_SXS_ASSEMBLY_NOT_FOUND;
+    SIZE_T appdir_len, name_len, len, total;
+    WCHAR *buffer, *p;
+
+    if (!acl->private_path || !appdir) return status;
+
+    appdir_len = wcslen( appdir );
+    name_len = wcslen( ai->name );
+    total = appdir_len + wcslen( acl->private_path ) + 2 * name_len + wcslen( lang ) + 16;
+    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, total * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
+
+    for (path = acl->private_path; *path; path = next)
+    {
+        if (!(next = wcschr( path, ';' ))) next = path + wcslen( path );
+        len = next - path;
+        if (*next) next++;
+        while (len && (path[0] == ' ' || path[0] == '\t')) { path++; len--; }
+        while (len && (path[len - 1] == ' ' || path[len - 1] == '\t' ||
+                       path[len - 1] == '\\' || path[len - 1] == '/')) len--;
+        if (!len) continue;
+        if (!is_valid_private_path( path, len ))
+        {
+            WARN( "ignoring invalid privatePath entry %s\n", debugstr_wn( path, len ));
+            continue;
+        }
+
+        memcpy( buffer, appdir, appdir_len * sizeof(WCHAR) );
+        p = buffer + appdir_len;
+        if (appdir_len && p[-1] != '\\') *p++ = '\\';
+        memcpy( p, path, len * sizeof(WCHAR) );
+        p += len;
+        *p++ = '\\';
+        *p = 0;
+        TRACE( "probing %s\n", debugstr_w(buffer) );
+        status = open_manifest_file( acl, ai, lang, directory, buffer, total );
+        if (status != STATUS_SXS_ASSEMBLY_NOT_FOUND) break;
+
+        memcpy( p, ai->name, name_len * sizeof(WCHAR) );
+        p[name_len] = '\\';
+        p[name_len + 1] = 0;
+        status = open_manifest_file( acl, ai, lang, directory, buffer, total );
+        if (status != STATUS_SXS_ASSEMBLY_NOT_FOUND) break;
+    }
+
+    RtlFreeHeap( GetProcessHeap(), 0, buffer );
+    return status;
+}
+
 static NTSTATUS lookup_assembly(struct actctx_loader* acl,
                                 struct assembly_identity* ai)
 {
@@ -3403,7 +3654,8 @@ static NTSTATUS lookup_assembly(struct actctx_loader* acl,
      *           <dir>\name\name.dll
      *           <dir>\name\name.manifest
      *
-     * First 'appdir' is used as <dir>, if that failed
+     * First 'appdir' is used as <dir>, then the privatePath directories
+     * of the application configuration file, and if that failed
      * it tries application manifest file path.
      */
     wcscpy( buffer, acl->actctx->appdir.info );
@@ -3414,6 +3666,9 @@ static NTSTATUS lookup_assembly(struct actctx_loader* acl,
 
     swprintf( buffer, total, L"%s%s\\", acl->actctx->appdir.info, ai->name );
     status = open_manifest_file( acl, ai, lang, directory, buffer, total );
+    if (status != STATUS_SXS_ASSEMBLY_NOT_FOUND) goto done;
+
+    status = lookup_private_path( acl, ai, lang, directory );
     if (status != STATUS_SXS_ASSEMBLY_NOT_FOUND) goto done;
 
     if (RtlGetFullPathName_U( acl->actctx->assemblies->manifest.info, len * sizeof(WCHAR), buffer, &p ))
@@ -5389,6 +5644,7 @@ NTSTATUS WINAPI RtlCreateActivationContext( ACTIVATION_CONTEXT **new_actctx, con
     acl.dependencies = NULL;
     acl.num_dependencies = 0;
     acl.allocated_dependencies = 0;
+    acl.private_path = NULL;
 
     if (pActCtx->dwFlags & ACTCTX_FLAG_LANGID_VALID) lang = pActCtx->wLangId;
     if (pActCtx->dwFlags & ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID) directory = pActCtx->lpAssemblyDirectory;
@@ -5422,8 +5678,13 @@ NTSTATUS WINAPI RtlCreateActivationContext( ACTIVATION_CONTEXT **new_actctx, con
     if (file) NtClose( file );
     RtlFreeUnicodeString( &nameW );
 
-    if (status == STATUS_SUCCESS) status = parse_depend_manifests(&acl);
+    if (status == STATUS_SUCCESS)
+    {
+        load_app_config( &acl );
+        status = parse_depend_manifests(&acl);
+    }
     free_depend_manifests( &acl );
+    RtlFreeHeap( GetProcessHeap(), 0, acl.private_path );
 
     if (status == STATUS_SUCCESS) *new_actctx = actctx;
     else actctx_release( actctx );

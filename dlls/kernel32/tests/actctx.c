@@ -3157,6 +3157,111 @@ todo_wine {
     }
 }
 
+static void write_file_in(const char *dir, const char *name, const char *data)
+{
+    char path[MAX_PATH];
+    HANDLE file;
+    DWORD size;
+
+    sprintf(path, "%s%s", dir, name);
+    file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ok(file != INVALID_HANDLE_VALUE, "CreateFile %s failed: %lu\n", path, GetLastError());
+    WriteFile(file, data, strlen(data), &size, NULL);
+    CloseHandle(file);
+}
+
+static void test_private_path(void)
+{
+    static const char app_manifest[] =
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">"
+        "<assemblyIdentity version=\"1.0.0.0\" name=\"ppapp\" type=\"win32\"/>"
+        "<dependency><dependentAssembly>"
+        "<assemblyIdentity type=\"win32\" name=\"ppdep\" version=\"1.0.0.0\" processorArchitecture=\"*\" language=\"*\"/>"
+        "</dependentAssembly></dependency>"
+        "</assembly>";
+    static const char dep_manifest[] =
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">"
+        "<assemblyIdentity version=\"1.0.0.0\" name=\"ppdep\" type=\"win32\"/>"
+        "</assembly>";
+    static const char config[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<configuration>"
+        "<runtime><assemblyBinding xmlns=\"urn:schemas-microsoft-com:asm.v1\">"
+        "<probing privatePath=\"nowhere\"/></assemblyBinding></runtime>"
+        "<windows><assemblyBinding xmlns=\"urn:schemas-microsoft-com:asm.v1\">"
+        "<probing privatePath=\"missing;priv\"/></assemblyBinding></windows>"
+        "</configuration>";
+    static const char config_runtime_only[] =
+        "<configuration>"
+        "<runtime><assemblyBinding xmlns=\"urn:schemas-microsoft-com:asm.v1\">"
+        "<probing privatePath=\"priv\"/></assemblyBinding></runtime>"
+        "</configuration>";
+    char dir[MAX_PATH], priv[MAX_PATH], path[MAX_PATH];
+    ACTCTXA actctx;
+    HANDLE handle;
+
+    GetTempPathA(ARRAY_SIZE(dir), dir);
+    strcat(dir, "wine_actctx_pp\\");
+    CreateDirectoryA(dir, NULL);
+    sprintf(priv, "%spriv\\", dir);
+    CreateDirectoryA(priv, NULL);
+
+    write_file_in(dir, "app.exe.manifest", app_manifest);
+    write_file_in(priv, "ppdep.manifest", dep_manifest);
+    sprintf(path, "%sapp.exe.manifest", dir);
+
+    memset(&actctx, 0, sizeof(actctx));
+    actctx.cbSize = sizeof(actctx);
+    actctx.dwFlags = ACTCTX_FLAG_APPLICATION_NAME_VALID;
+    actctx.lpSource = path;
+    actctx.lpApplicationName = dir;
+
+    /* without a configuration file the dependency is not found */
+    SetLastError(0xdeadbeef);
+    handle = CreateActCtxA(&actctx);
+    ok(handle == INVALID_HANDLE_VALUE, "CreateActCtx succeeded\n");
+    ok(GetLastError() == ERROR_SXS_CANT_GEN_ACTCTX, "got error %lu\n", GetLastError());
+    if (handle != INVALID_HANDLE_VALUE) ReleaseActCtx(handle);
+
+    /* the .NET <runtime> probing element does not apply to side-by-side */
+    write_file_in(dir, "app.exe.config", config_runtime_only);
+    SetLastError(0xdeadbeef);
+    handle = CreateActCtxA(&actctx);
+    ok(handle == INVALID_HANDLE_VALUE, "CreateActCtx succeeded\n");
+    ok(GetLastError() == ERROR_SXS_CANT_GEN_ACTCTX, "got error %lu\n", GetLastError());
+    if (handle != INVALID_HANDLE_VALUE) ReleaseActCtx(handle);
+
+    /* <windows><assemblyBinding><probing privatePath> is searched, entries separated by ';' */
+    write_file_in(dir, "app.exe.config", config);
+    SetLastError(0xdeadbeef);
+    handle = CreateActCtxA(&actctx);
+    ok(handle != INVALID_HANDLE_VALUE, "CreateActCtx failed: %lu\n", GetLastError());
+    if (handle != INVALID_HANDLE_VALUE) ReleaseActCtx(handle);
+
+    /* <privatePath>\name\name.manifest works too */
+    sprintf(path, "%sppdep.manifest", priv);
+    DeleteFileA(path);
+    sprintf(path, "%sppdep\\", priv);
+    CreateDirectoryA(path, NULL);
+    write_file_in(path, "ppdep.manifest", dep_manifest);
+    sprintf(path, "%sapp.exe.manifest", dir);
+    SetLastError(0xdeadbeef);
+    handle = CreateActCtxA(&actctx);
+    ok(handle != INVALID_HANDLE_VALUE, "CreateActCtx failed: %lu\n", GetLastError());
+    if (handle != INVALID_HANDLE_VALUE) ReleaseActCtx(handle);
+
+    sprintf(path, "%sppdep\\ppdep.manifest", priv);
+    DeleteFileA(path);
+    sprintf(path, "%sppdep", priv);
+    RemoveDirectoryA(path);
+    RemoveDirectoryA(priv);
+    sprintf(path, "%sapp.exe.config", dir);
+    DeleteFileA(path);
+    sprintf(path, "%sapp.exe.manifest", dir);
+    DeleteFileA(path);
+    RemoveDirectoryA(dir);
+}
+
 static void test_CreateActCtx_share_mode(void)
 {
     WCHAR tmp_manifest_pathname[MAX_PATH];
@@ -4801,6 +4906,7 @@ START_TEST(actctx)
     test_create_fail();
     test_CreateActCtx();
     test_CreateActCtx_share_mode();
+    test_private_path();
     test_findsectionstring();
     test_ZombifyActCtx();
     run_child_process();
