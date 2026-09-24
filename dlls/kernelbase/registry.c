@@ -3212,30 +3212,61 @@ cleanup:
  */
 LSTATUS WINAPI RegLoadAppKeyA(const char *file, HKEY *result, REGSAM sam, DWORD options, DWORD reserved)
 {
-    FIXME("%s %p %lu %lu %lu: stub\n", wine_dbgstr_a(file), result, sam, options, reserved);
+    UNICODE_STRING fileW;
+    LSTATUS ret;
 
     if (!file || reserved)
         return ERROR_INVALID_PARAMETER;
-
-    *result = (HKEY)0xdeadbeef;
-    return ERROR_SUCCESS;
+    if (!RtlCreateUnicodeStringFromAsciiz( &fileW, file ))
+        return ERROR_NOT_ENOUGH_MEMORY;
+    ret = RegLoadAppKeyW( fileW.Buffer, result, sam, options, reserved );
+    RtlFreeUnicodeString( &fileW );
+    return ret;
 }
 
 /******************************************************************************
  * RegLoadAppKeyW (kernelbase.@)
  *
+ * Application hives are private: they are mounted under \REGISTRY\A, which
+ * cannot be enumerated, and are only reachable through the returned key.
  */
 LSTATUS WINAPI RegLoadAppKeyW(const WCHAR *file, HKEY *result, REGSAM sam, DWORD options, DWORD reserved)
 {
-    FIXME("%s %p %lu %lu %lu: stub\n", wine_dbgstr_w(file), result, sam, options, reserved);
+    static LONG counter;
+    OBJECT_ATTRIBUTES attr, file_attr;
+    UNICODE_STRING nameW, fileW;
+    WCHAR name[64];
+    HANDLE root, key;
+    NTSTATUS status;
 
-    if (!file || reserved)
+    TRACE( "%s %p %#lx %#lx %lu\n", debugstr_w(file), result, sam, options, reserved );
+
+    if (!file || !result || reserved)
         return ERROR_INVALID_PARAMETER;
+    if (options & ~REG_PROCESS_APPKEY) FIXME( "unsupported options %#lx\n", options );
 
-    *result = (HKEY)0xdeadbeef;
+    RtlInitUnicodeString( &nameW, L"\\REGISTRY\\A" );
+    InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
+    status = NtCreateKey( &root, KEY_CREATE_SUB_KEY, &attr, 0, NULL, 0, NULL );
+    if (status) return RtlNtStatusToDosError( status );
+    NtClose( root );
+
+    swprintf( name, ARRAY_SIZE(name), L"\\REGISTRY\\A\\{%08lx-%08lx-%08lx}",
+              GetCurrentProcessId(), GetTickCount(), InterlockedIncrement( &counter ));
+    RtlInitUnicodeString( &nameW, name );
+    InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
+
+    if (!RtlDosPathNameToNtPathName_U( file, &fileW, NULL, NULL ))
+        return ERROR_PATH_NOT_FOUND;
+    InitializeObjectAttributes( &file_attr, &fileW, OBJ_CASE_INSENSITIVE, 0, NULL );
+
+    status = NtLoadKeyEx( &attr, &file_attr, REG_APP_HIVE, 0, 0, sam, &key, NULL );
+    RtlFreeUnicodeString( &fileW );
+    if (status) return RtlNtStatusToDosError( status );
+
+    *result = key;
     return ERROR_SUCCESS;
 }
-
 
 /***********************************************************************
  * DnsHostnameToComputerNameExW   (kernelbase.@)

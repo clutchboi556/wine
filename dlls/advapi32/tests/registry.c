@@ -1715,7 +1715,7 @@ static void test_reg_load_app_key(void)
     ok(appkey != NULL, "got a null key\n");
 
     ret = RegSetValueExA(appkey, "testkey", 0, REG_BINARY, test_data, sizeof(test_data));
-    todo_wine ok(ret == ERROR_SUCCESS, "couldn't set key value %lx\n", ret);
+    ok(ret == ERROR_SUCCESS, "couldn't set key value %lx\n", ret);
     RegCloseKey(appkey);
 
     wait_file_available(hivefilepath);
@@ -1739,6 +1739,217 @@ static void test_reg_load_app_key(void)
     p = strrchr(hivefilepath, '\\');
     *p = 0;
     delete_dir(hivefilepath);
+}
+
+/* Build a minimal but valid Windows registry hive (regf) in memory:
+ *   (root)  @ = REG_SZ "root"
+ *   Sub     "dword" = REG_DWORD 0x12345678 (inline data), "string" = REG_SZ "hello",
+ *           "a\b" = REG_DWORD 1 (value names may contain backslashes)
+ *   \x00dcn\x00ef (UTF-16 key name)
+ */
+struct hive_builder
+{
+    BYTE data[2 * 4096];
+    DWORD used;         /* bytes used in the hive bin */
+};
+
+static DWORD hive_cell(struct hive_builder *h, const void *data, DWORD len)
+{
+    DWORD size = (4 + len + 7) & ~7, off = h->used;
+    BYTE *bin = h->data + 4096;
+
+    assert(off + size <= 4096);
+    *(LONG *)(bin + off) = -(LONG)size;
+    memcpy(bin + off + 4, data, len);
+    h->used += size;
+    return off;
+}
+
+static DWORD hive_value(struct hive_builder *h, const char *name, DWORD type, const void *data, DWORD len)
+{
+    BYTE vk[64] = { 'v', 'k' };
+    DWORD name_len = strlen(name);
+
+    *(WORD *)(vk + 2) = name_len;
+    if (len <= 4)
+    {
+        *(DWORD *)(vk + 4) = len | 0x80000000;
+        memcpy(vk + 8, data, len);
+    }
+    else
+    {
+        *(DWORD *)(vk + 4) = len;
+        *(DWORD *)(vk + 8) = hive_cell(h, data, len);
+    }
+    *(DWORD *)(vk + 12) = type;
+    *(WORD *)(vk + 16) = 1;  /* compressed (Latin-1) name */
+    memcpy(vk + 20, name, name_len);
+    return hive_cell(h, vk, 20 + name_len);
+}
+
+static DWORD hive_name_hash(const WCHAR *name)
+{
+    DWORD hash = 0;
+    while (*name) hash = hash * 37 + (WCHAR)(ULONG_PTR)CharUpperW((WCHAR *)(ULONG_PTR)*name++);
+    return hash;
+}
+
+static DWORD hive_key(struct hive_builder *h, const WCHAR *name, DWORD sk, DWORD parent,
+                      const DWORD *values, DWORD value_count, const DWORD *subkeys,
+                      const WCHAR **subkey_names, DWORD subkey_count)
+{
+    BYTE nk[128] = { 'n', 'k' }, list[64];
+    DWORD i, name_len = wcslen(name), ascii = 1;
+
+    for (i = 0; i < name_len; i++) if (name[i] > 0x7f) ascii = 0;
+    *(WORD *)(nk + 2) = ascii ? 0x20 : 0;           /* KEY_COMP_NAME */
+    if (!parent) *(WORD *)(nk + 2) |= 0x04 | 0x08;  /* KEY_HIVE_ENTRY | KEY_NO_DELETE */
+    *(DWORD *)(nk + 16) = parent;
+    *(DWORD *)(nk + 20) = subkey_count;
+    *(DWORD *)(nk + 28) = ~0u;
+    *(DWORD *)(nk + 32) = ~0u;
+    if (subkey_count)
+    {
+        list[0] = 'l'; list[1] = 'h';
+        *(WORD *)(list + 2) = subkey_count;
+        for (i = 0; i < subkey_count; i++)
+        {
+            *(DWORD *)(list + 4 + 8 * i) = subkeys[i];
+            *(DWORD *)(list + 8 + 8 * i) = hive_name_hash(subkey_names[i]);
+        }
+        *(DWORD *)(nk + 28) = hive_cell(h, list, 4 + 8 * subkey_count);
+    }
+    *(DWORD *)(nk + 36) = value_count;
+    *(DWORD *)(nk + 40) = value_count ? hive_cell(h, values, value_count * sizeof(DWORD)) : ~0u;
+    *(DWORD *)(nk + 44) = sk;
+    *(DWORD *)(nk + 48) = ~0u;
+    *(DWORD *)(nk + 52) = 32;   /* largest subkey name */
+    *(DWORD *)(nk + 60) = 32;   /* largest value name */
+    *(DWORD *)(nk + 64) = 64;   /* largest value data */
+    if (ascii)
+    {
+        for (i = 0; i < name_len; i++) nk[76 + i] = name[i];
+        *(WORD *)(nk + 72) = name_len;
+    }
+    else
+    {
+        memcpy(nk + 76, name, name_len * sizeof(WCHAR));
+        *(WORD *)(nk + 72) = name_len * sizeof(WCHAR);
+    }
+    return hive_cell(h, nk, 76 + *(WORD *)(nk + 72));
+}
+
+static void set_hive_parent(struct hive_builder *h, DWORD key, DWORD parent)
+{
+    *(DWORD *)(h->data + 4096 + key + 4 + 16) = parent;
+}
+
+static BOOL write_test_hive(const char *path)
+{
+    static const WCHAR uni_name[] = { 0xdc, 'n', 0xef, 0 };
+    static const WCHAR *names[] = { L"Sub", uni_name };
+    static const WCHAR root_str[] = L"root", hello[] = L"hello";
+    struct hive_builder *h = calloc(1, sizeof(*h));
+    SECURITY_DESCRIPTOR sd;
+    BYTE sk[256] = { 's', 'k' }, rel[128];
+    DWORD rel_size = sizeof(rel), values[3], subkeys[2], root, sub, uni, dword = 0x12345678, one = 1;
+    DWORD i, checksum = 0, *base = (DWORD *)h->data, written;
+    HANDLE file;
+    BOOL ret;
+
+    h->used = 0x20;  /* after the hbin header */
+
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+    if (!MakeSelfRelativeSD(&sd, rel, &rel_size)) return FALSE;
+    *(DWORD *)(sk + 12) = 3;          /* reference count */
+    *(DWORD *)(sk + 16) = rel_size;
+    memcpy(sk + 20, rel, rel_size);
+    i = hive_cell(h, sk, 20 + rel_size);
+    *(DWORD *)(h->data + 4096 + i + 4 + 4) = i;   /* flink */
+    *(DWORD *)(h->data + 4096 + i + 4 + 8) = i;   /* blink */
+
+    values[0] = hive_value(h, "dword", REG_DWORD, &dword, sizeof(dword));
+    values[1] = hive_value(h, "string", REG_SZ, hello, sizeof(hello));
+    values[2] = hive_value(h, "a\\b", REG_DWORD, &one, sizeof(one));
+    sub = hive_key(h, L"Sub", i, 0, values, 3, NULL, NULL, 0);
+    uni = hive_key(h, uni_name, i, 0, NULL, 0, NULL, NULL, 0);
+    subkeys[0] = sub;
+    subkeys[1] = uni;
+    values[0] = hive_value(h, "", REG_SZ, root_str, sizeof(root_str));
+    root = hive_key(h, L"ROOT", i, 0, values, 1, subkeys, names, 2);
+    set_hive_parent(h, sub, root);
+    set_hive_parent(h, uni, root);
+
+    memcpy(h->data, "regf", 4);
+    base[1] = base[2] = 1;       /* sequence numbers */
+    base[5] = 1;                 /* major version */
+    base[6] = 5;                 /* minor version */
+    base[8] = 1;                 /* format: direct memory load */
+    base[9] = root;
+    base[10] = 4096;             /* size of the hive bins */
+    base[11] = 1;                /* clustering factor */
+    for (i = 0; i < 127; i++) checksum ^= base[i];
+    base[127] = checksum == ~0u ? ~1u : checksum ? checksum : 1;
+
+    memcpy(h->data + 4096, "hbin", 4);
+    *(DWORD *)(h->data + 4096 + 8) = 4096;
+    /* the rest of the bin is one free cell */
+    *(LONG *)(h->data + 4096 + h->used) = 4096 - h->used;
+
+    file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    ret = file != INVALID_HANDLE_VALUE && WriteFile(file, h->data, sizeof(h->data), &written, NULL);
+    CloseHandle(file);
+    free(h);
+    return ret;
+}
+
+static void test_reg_load_app_key_regf(void)
+{
+    static const WCHAR uni_name[] = { 0xdc, 'n', 0xef, 0 };
+    char path[MAX_PATH];
+    WCHAR buffer[16];
+    DWORD ret, size, type, dword;
+    HKEY appkey, key;
+
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "wine_regf_hive.dat");
+    ok(write_test_hive(path), "failed to write hive\n");
+
+    ret = RegLoadAppKeyA(path, &appkey, KEY_READ, 0, 0);
+    ok(ret == ERROR_SUCCESS, "RegLoadAppKeyA failed: %lu\n", ret);
+    if (ret)
+    {
+        DeleteFileA(path);
+        return;
+    }
+
+    size = sizeof(buffer);
+    ret = RegQueryValueExW(appkey, NULL, NULL, &type, (BYTE *)buffer, &size);
+    ok(ret == ERROR_SUCCESS, "got %lu\n", ret);
+    ok(type == REG_SZ && !wcscmp(buffer, L"root"), "got type %lu %s\n", type, wine_dbgstr_w(buffer));
+
+    ret = RegOpenKeyExA(appkey, "Sub", 0, KEY_READ, &key);
+    ok(ret == ERROR_SUCCESS, "got %lu\n", ret);
+    size = sizeof(dword);
+    ret = RegQueryValueExA(key, "dword", NULL, &type, (BYTE *)&dword, &size);
+    ok(ret == ERROR_SUCCESS && type == REG_DWORD && dword == 0x12345678, "got %lu type %lu %#lx\n", ret, type, dword);
+    size = sizeof(buffer);
+    ret = RegQueryValueExW(key, L"string", NULL, &type, (BYTE *)buffer, &size);
+    ok(ret == ERROR_SUCCESS && type == REG_SZ && !wcscmp(buffer, L"hello"), "got %lu type %lu %s\n",
+       ret, type, wine_dbgstr_w(buffer));
+    size = sizeof(dword);
+    ret = RegQueryValueExA(key, "a\\b", NULL, &type, (BYTE *)&dword, &size);
+    ok(ret == ERROR_SUCCESS && dword == 1, "got %lu %lu\n", ret, dword);
+    RegCloseKey(key);
+
+    ret = RegOpenKeyExW(appkey, uni_name, 0, KEY_READ, &key);
+    ok(ret == ERROR_SUCCESS, "got %lu\n", ret);
+    RegCloseKey(key);
+
+    RegCloseKey(appkey);
+    wait_file_available(path);
+    DeleteFileA(path);
 }
 
 /* tests that show that RegConnectRegistry and
@@ -5189,6 +5400,7 @@ START_TEST(registry)
     test_classesroot_mask();
     test_reg_load_key();
     test_reg_load_app_key();
+    test_reg_load_app_key_regf();
     test_reg_copy_tree();
     test_reg_delete_tree();
     test_rw_order();

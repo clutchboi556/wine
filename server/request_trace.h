@@ -1196,7 +1196,14 @@ static void dump_delete_key_value_request( const struct delete_key_value_request
 static void dump_load_registry_request( const struct load_registry_request *req )
 {
     fprintf( stderr, " file=%04x", req->file );
+    fprintf( stderr, ", flags=%08x", req->flags );
+    fprintf( stderr, ", access=%08x", req->access );
     dump_varargs_object_attributes( ", objattr=", cur_size );
+}
+
+static void dump_load_registry_reply( const struct load_registry_reply *req )
+{
+    fprintf( stderr, " hkey=%04x", req->hkey );
 }
 
 static void dump_unload_registry_request( const struct unload_registry_request *req )
@@ -3977,7 +3984,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_key_value_reply,
     (dump_func)dump_enum_key_value_reply,
     NULL,
-    NULL,
+    (dump_func)dump_load_registry_reply,
     NULL,
     NULL,
     NULL,
@@ -4643,6 +4650,8 @@ static const struct
     { "PROCESS_IS_TERMINATING",      STATUS_PROCESS_IS_TERMINATING },
     { "PROCESS_NOT_IN_JOB",          STATUS_PROCESS_NOT_IN_JOB },
     { "RANGE_NOT_LOCKED",            STATUS_RANGE_NOT_LOCKED },
+    { "REGISTRY_CORRUPT",            STATUS_REGISTRY_CORRUPT },
+    { "REGISTRY_IO_FAILED",          STATUS_REGISTRY_IO_FAILED },
     { "REPARSE_POINT_NOT_RESOLVED",  STATUS_REPARSE_POINT_NOT_RESOLVED },
     { "SECTION_TOO_BIG",             STATUS_SECTION_TOO_BIG },
     { "SEMAPHORE_LIMIT_EXCEEDED",    STATUS_SEMAPHORE_LIMIT_EXCEEDED },

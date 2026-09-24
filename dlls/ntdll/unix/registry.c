@@ -715,7 +715,7 @@ NTSTATUS WINAPI NtLoadKeyEx( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *f
                              HANDLE event, ACCESS_MASK access, HANDLE *roothandle, IO_STATUS_BLOCK *iostatus )
 {
     unsigned int ret;
-    HANDLE key;
+    HANDLE key, hkey = 0;
     data_size_t len;
     struct object_attributes *objattr;
     char *unix_name;
@@ -725,12 +725,13 @@ NTSTATUS WINAPI NtLoadKeyEx( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *f
     TRACE( "(%p,%p,0x%x,%p,%p,0x%x,%p,%p)\n",
            attr, file, flags, trustkey, event, access, roothandle, iostatus );
 
-    if (flags) FIXME( "flags %x not handled\n", flags );
+    if (flags & ~REG_APP_HIVE) FIXME( "flags %x not handled\n", flags );
     if (trustkey) FIXME("trustkey parameter not supported\n");
     if (event) FIXME("event parameter not supported\n");
-    if (access) FIXME("access parameter not supported\n");
-    if (roothandle) FIXME("roothandle is not filled\n");
+    if (access && !(flags & REG_APP_HIVE)) FIXME("access parameter not supported\n");
+    if (roothandle && !(flags & REG_APP_HIVE)) FIXME("roothandle is not filled\n");
     if (iostatus) FIXME("iostatus is not filled\n");
+    if (roothandle) *roothandle = 0;
 
     if (!(ret = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, FALSE )))
     {
@@ -747,12 +748,18 @@ NTSTATUS WINAPI NtLoadKeyEx( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *f
 
     SERVER_START_REQ( load_registry )
     {
-        req->file = wine_server_obj_handle( key );
+        req->file   = wine_server_obj_handle( key );
+        req->flags  = flags;
+        req->access = access;
         wine_server_add_data( req, objattr, len );
         ret = wine_server_call( req );
         if (ret == STATUS_OBJECT_NAME_EXISTS) ret = STATUS_SUCCESS;
+        hkey = wine_server_ptr_handle( reply->hkey );
     }
     SERVER_END_REQ;
+
+    if (!ret && roothandle && (flags & REG_APP_HIVE)) *roothandle = hkey;
+    else if (hkey) NtClose( hkey );
 
     NtClose( key );
     free( objattr );
