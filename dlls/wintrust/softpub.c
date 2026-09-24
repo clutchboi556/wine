@@ -700,6 +700,272 @@ static LPCSTR filetime_to_str(const FILETIME *time)
     return date;
 }
 
+/* Reads the tag and length of the DER element at *ptr, leaving *ptr at its
+ * contents. */
+static BOOL der_read_header(const BYTE **ptr, const BYTE *end, BYTE *tag, DWORD *len)
+{
+    const BYTE *p = *ptr;
+    DWORD n;
+
+    if (end - p < 2) return FALSE;
+    *tag = *p++;
+    if (!(*p & 0x80)) *len = *p++;
+    else
+    {
+        n = *p++ & 0x7f;
+        if (!n || n > 4 || end - p < n) return FALSE;
+        for (*len = 0; n; n--) *len = (*len << 8) | *p++;
+    }
+    if (*len > end - p) return FALSE;
+    *ptr = p;
+    return TRUE;
+}
+
+/* TSTInfo ::= SEQUENCE { version INTEGER, policy OBJECT IDENTIFIER,
+ *     messageImprint SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING },
+ *     serialNumber INTEGER, genTime GeneralizedTime, ... }  (RFC 3161) */
+static BOOL WINTRUST_ParseTSTInfo(const BYTE *ptr, DWORD size, FILETIME *time,
+ char *hash_oid, DWORD hash_oid_size, CRYPT_DATA_BLOB *imprint)
+{
+    const BYTE *end = ptr + size, *elem, *imprint_end;
+    CRYPT_OBJID_BLOB oid_blob;
+    LPSTR oid = NULL;
+    DWORD len;
+    BYTE tag;
+    BOOL ret;
+
+    if (!der_read_header(&ptr, end, &tag, &len) || tag != 0x30) return FALSE;
+    end = ptr + len;
+    /* version, policy */
+    if (!der_read_header(&ptr, end, &tag, &len) || tag != 0x02) return FALSE;
+    ptr += len;
+    if (!der_read_header(&ptr, end, &tag, &len) || tag != 0x06) return FALSE;
+    ptr += len;
+    /* messageImprint */
+    if (!der_read_header(&ptr, end, &tag, &len) || tag != 0x30) return FALSE;
+    imprint_end = ptr + len;
+    if (!der_read_header(&ptr, imprint_end, &tag, &len) || tag != 0x30) return FALSE;
+    elem = ptr;
+    ptr += len;
+    oid_blob.pbData = (BYTE *)elem;
+    if (!der_read_header(&elem, ptr, &tag, &len) || tag != 0x06) return FALSE;
+    oid_blob.cbData = len + (elem - oid_blob.pbData);
+    size = 0;
+    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_OBJECT_IDENTIFIER, oid_blob.pbData,
+     oid_blob.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &oid, &size))
+        return FALSE;
+    ret = strlen(*(LPSTR *)oid) < hash_oid_size;
+    if (ret) strcpy(hash_oid, *(LPSTR *)oid);
+    LocalFree(oid);
+    if (!ret) return FALSE;
+    if (!der_read_header(&ptr, imprint_end, &tag, &len) || tag != 0x04) return FALSE;
+    imprint->pbData = (BYTE *)ptr;
+    imprint->cbData = len;
+    ptr = imprint_end;
+    /* serialNumber */
+    if (!der_read_header(&ptr, end, &tag, &len) || tag != 0x02) return FALSE;
+    ptr += len;
+    /* genTime */
+    elem = ptr;
+    if (!der_read_header(&ptr, end, &tag, &len) || tag != 0x18) return FALSE;
+    len += ptr - elem;
+    size = sizeof(*time);
+    return CryptDecodeObjectEx(X509_ASN_ENCODING, X509_CHOICE_OF_TIME, elem, len, 0, NULL, time, &size);
+}
+
+/* The token must be bound to this signature: its message imprint is a hash
+ * of the signer's signature value. */
+static BOOL WINTRUST_CheckImprint(const char *hash_oid, const CRYPT_DATA_BLOB *imprint,
+ const CRYPT_DATA_BLOB *signature)
+{
+    BYTE hash[64];
+    DWORD size = sizeof(hash);
+    HCRYPTPROV prov;
+    HCRYPTHASH h;
+    ALG_ID alg;
+    BOOL ret = FALSE;
+
+    if (!(alg = CertOIDToAlgId(hash_oid))) return FALSE;
+    if (!CryptAcquireContextW(&prov, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        return FALSE;
+    if (CryptCreateHash(prov, alg, 0, 0, &h))
+    {
+        if (CryptHashData(h, signature->pbData, signature->cbData, 0) &&
+            CryptGetHashParam(h, HP_HASHVAL, hash, &size, 0))
+            ret = size == imprint->cbData && !memcmp(hash, imprint->pbData, size);
+        CryptDestroyHash(h);
+    }
+    CryptReleaseContext(prov, 0);
+    return ret;
+}
+
+/* The messageDigest signed attribute must match the TSTInfo actually present. */
+static BOOL WINTRUST_CheckTokenDigest(HCRYPTMSG msg)
+{
+    static const DWORD encoding = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+    CRYPT_ATTRIBUTES *attrs = NULL;
+    CRYPT_DATA_BLOB *digest = NULL;
+    BYTE computed[64];
+    DWORD size, i;
+    BOOL ret = FALSE;
+
+    size = sizeof(computed);
+    if (!CryptMsgGetParam(msg, CMSG_COMPUTED_HASH_PARAM, 0, computed, &size)) return FALSE;
+    if (!CryptMsgGetParam(msg, CMSG_SIGNER_AUTH_ATTR_PARAM, 0, NULL, &i)) return FALSE;
+    if (!(attrs = malloc(i))) return FALSE;
+    if (!CryptMsgGetParam(msg, CMSG_SIGNER_AUTH_ATTR_PARAM, 0, attrs, &i)) goto done;
+
+    for (i = 0; !ret && i < attrs->cAttr; i++)
+    {
+        DWORD len;
+
+        if (strcmp(attrs->rgAttr[i].pszObjId, szOID_RSA_messageDigest) || attrs->rgAttr[i].cValue != 1)
+            continue;
+        if (!CryptDecodeObjectEx(encoding, X509_OCTET_STRING, attrs->rgAttr[i].rgValue[0].pbData,
+         attrs->rgAttr[i].rgValue[0].cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &digest, &len))
+            break;
+        ret = digest->cbData == size && !memcmp(digest->pbData, computed, size);
+        LocalFree(digest);
+    }
+done:
+    free(attrs);
+    return ret;
+}
+
+/* The timestamp authority must have signed the token with a certificate that
+ * is valid for timestamping and chains to a trusted root at the stamped time. */
+static BOOL WINTRUST_VerifyTokenSigner(HCRYPTMSG msg, const FILETIME *time)
+{
+    static const DWORD encoding = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+    static char timestamp_eku[] = szOID_PKIX_KP_TIMESTAMP_SIGNING;
+    char *usage[] = { timestamp_eku };
+    CERT_CHAIN_PARA chain_para = { sizeof(chain_para) };
+    CERT_CHAIN_POLICY_PARA policy_para = { sizeof(policy_para) };
+    CERT_CHAIN_POLICY_STATUS policy_status = { sizeof(policy_status) };
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    PCCERT_CONTEXT cert = NULL;
+    CERT_INFO *signer = NULL;
+    HCERTSTORE store;
+    DWORD size;
+    BOOL ret = FALSE;
+
+    if (!(store = CertOpenStore(CERT_STORE_PROV_MSG, encoding, 0, 0, msg)))
+    {
+        WARN("failed to open the timestamp token store: %#lx\n", GetLastError());
+        return FALSE;
+    }
+    if (!CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, NULL, &size) ||
+        !(signer = malloc(size)) ||
+        !CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, signer, &size))
+    {
+        WARN("failed to get the timestamp signer: %#lx\n", GetLastError());
+        goto done;
+    }
+    if (!(cert = CertGetSubjectCertificateFromStore(store, encoding, signer)))
+    {
+        WARN("timestamp signer certificate not found\n");
+        goto done;
+    }
+
+    if (!CryptMsgControl(msg, 0, CMSG_CTRL_VERIFY_SIGNATURE, cert->pCertInfo))
+    {
+        WARN("timestamp signature does not verify\n");
+        goto done;
+    }
+    if (!WINTRUST_CheckTokenDigest(msg))
+    {
+        WARN("timestamp message digest mismatch\n");
+        goto done;
+    }
+
+    chain_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    chain_para.RequestedUsage.Usage.cUsageIdentifier = 1;
+    chain_para.RequestedUsage.Usage.rgpszUsageIdentifier = usage;
+    if (!CertGetCertificateChain(NULL, cert, (FILETIME *)time, store, &chain_para,
+     CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, NULL, &chain))
+    {
+        WARN("failed to build the timestamp authority chain: %#lx\n", GetLastError());
+        goto done;
+    }
+    if (chain->TrustStatus.dwErrorStatus)
+    {
+        WARN("timestamp authority chain error %#lx\n", chain->TrustStatus.dwErrorStatus);
+        goto done;
+    }
+    ret = CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASE, chain, &policy_para, &policy_status) &&
+          !policy_status.dwError;
+    if (!ret) WARN("timestamp authority chain policy error %#lx\n", policy_status.dwError);
+
+done:
+    if (chain) CertFreeCertificateChain(chain);
+    if (cert) CertFreeCertificateContext(cert);
+    free(signer);
+    CertCloseStore(store, 0);
+    return ret;
+}
+
+/* The value of an RFC 3161 countersignature is a timestamp token: a CMS
+ * SignedData whose content is a TSTInfo.  Its time is only used if the token
+ * verifies and is bound to the signature it countersigns. */
+static BOOL WINTRUST_GetTimeFromRFC3161Token(const CRYPT_ATTR_BLOB *token,
+ const CRYPT_DATA_BLOB *signature, FILETIME *time)
+{
+    static const DWORD encoding = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+    char content_type[sizeof(szOID_TIMESTAMP_TOKEN)], hash_oid[128];
+    CRYPT_DATA_BLOB imprint;
+    const BYTE *ptr;
+    BYTE *content = NULL, tag;
+    DWORD size, len;
+    HCRYPTMSG msg;
+    BOOL ret = FALSE;
+
+    if (!(msg = CryptMsgOpenToDecode(encoding, 0, 0, 0, NULL, NULL))) return FALSE;
+    if (!CryptMsgUpdate(msg, token->pbData, token->cbData, TRUE))
+    {
+        WARN("failed to decode timestamp token: %#lx\n", GetLastError());
+        goto done;
+    }
+
+    size = sizeof(content_type);
+    if (!CryptMsgGetParam(msg, CMSG_INNER_CONTENT_TYPE_PARAM, 0, content_type, &size) ||
+        strcmp(content_type, szOID_TIMESTAMP_TOKEN))
+    {
+        WARN("unexpected timestamp token content\n");
+        goto done;
+    }
+    if (!CryptMsgGetParam(msg, CMSG_CONTENT_PARAM, 0, NULL, &size) ||
+        !(content = malloc(size)) ||
+        !CryptMsgGetParam(msg, CMSG_CONTENT_PARAM, 0, content, &size))
+    {
+        WARN("failed to get the timestamp token content: %#lx\n", GetLastError());
+        goto done;
+    }
+
+    /* the content may still be wrapped in the eContent OCTET STRING */
+    ptr = content;
+    if (!(size && content[0] == 0x04 && der_read_header(&ptr, content + size, &tag, &len)))
+    {
+        ptr = content;
+        len = size;
+    }
+    if (!WINTRUST_ParseTSTInfo(ptr, len, time, hash_oid, sizeof(hash_oid), &imprint))
+    {
+        WARN("invalid TSTInfo\n");
+        goto done;
+    }
+    if (!WINTRUST_CheckImprint(hash_oid, &imprint, signature))
+    {
+        WARN("timestamp is not for this signature\n");
+        goto done;
+    }
+    ret = WINTRUST_VerifyTokenSigner(msg, time);
+
+done:
+    free(content);
+    CryptMsgClose(msg);
+    return ret;
+}
+
 static FILETIME WINTRUST_GetTimeFromSigner(const CRYPT_PROVIDER_DATA *data,
  const CMSG_SIGNER_INFO *signerInfo)
 {
@@ -732,6 +998,16 @@ static FILETIME WINTRUST_GetTimeFromSigner(const CRYPT_PROVIDER_DATA *data,
                     LocalFree(counterSignerInfo);
                 }
             }
+        }
+        else if (!strcmp(signerInfo->UnauthAttrs.rgAttr[i].pszObjId,
+         szOID_RFC3161_counterSign))
+        {
+            const CRYPT_ATTRIBUTE *attr = &signerInfo->UnauthAttrs.rgAttr[i];
+            DWORD j;
+
+            for (j = 0; !foundTimeStamp && j < attr->cValue; j++)
+                foundTimeStamp = WINTRUST_GetTimeFromRFC3161Token(
+                 &attr->rgValue[j], &signerInfo->EncryptedHash, &time);
         }
     }
     if (!foundTimeStamp)
