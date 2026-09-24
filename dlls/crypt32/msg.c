@@ -3105,6 +3105,41 @@ static BOOL CRYPT_CopyAttr(void *pvData, DWORD *pcbData, const CRYPT_ATTRIBUTES 
     return ret;
 }
 
+/* The certificates field of a signed message is a set of CertificateChoices:
+ * X.509 certificates (SEQUENCE) and attribute certificates, which are
+ * implicitly tagged [1] (v1) or [2] (v2).  Other choices are ignored. */
+static BOOL is_attr_cert(const CERT_BLOB *blob)
+{
+    return blob->cbData && (blob->pbData[0] == (ASN_CONTEXT | ASN_CONSTRUCTOR | 1) ||
+                            blob->pbData[0] == (ASN_CONTEXT | ASN_CONSTRUCTOR | 2));
+}
+
+static BOOL is_x509_cert(const CERT_BLOB *blob)
+{
+    return blob->cbData && blob->pbData[0] == ASN_SEQUENCE;
+}
+
+static DWORD signed_msg_cert_count(const CRYPT_SIGNED_INFO *info, BOOL attr)
+{
+    DWORD i, count = 0;
+
+    for (i = 0; i < info->cCertEncoded; i++)
+        if (attr ? is_attr_cert(&info->rgCertEncoded[i]) : is_x509_cert(&info->rgCertEncoded[i])) count++;
+    return count;
+}
+
+static const CERT_BLOB *signed_msg_cert(const CRYPT_SIGNED_INFO *info, BOOL attr, DWORD index)
+{
+    DWORD i;
+
+    for (i = 0; i < info->cCertEncoded; i++)
+    {
+        if (!(attr ? is_attr_cert(&info->rgCertEncoded[i]) : is_x509_cert(&info->rgCertEncoded[i]))) continue;
+        if (!index--) return &info->rgCertEncoded[i];
+    }
+    return NULL;
+}
+
 static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
  DWORD dwIndex, void *pvData, DWORD *pcbData)
 {
@@ -3184,20 +3219,23 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
         break;
     case CMSG_CERT_COUNT_PARAM:
         if (msg->u.signed_data.info)
-            ret = CRYPT_CopyParam(pvData, pcbData,
-             &msg->u.signed_data.info->cCertEncoded, sizeof(DWORD));
+        {
+            DWORD count = signed_msg_cert_count(msg->u.signed_data.info, FALSE);
+
+            ret = CRYPT_CopyParam(pvData, pcbData, &count, sizeof(count));
+        }
         else
             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
         break;
     case CMSG_CERT_PARAM:
         if (msg->u.signed_data.info)
         {
-            if (dwIndex >= msg->u.signed_data.info->cCertEncoded)
+            const CERT_BLOB *cert = signed_msg_cert(msg->u.signed_data.info, FALSE, dwIndex);
+
+            if (!cert)
                 SetLastError(CRYPT_E_INVALID_INDEX);
             else
-                ret = CRYPT_CopyParam(pvData, pcbData,
-                 msg->u.signed_data.info->rgCertEncoded[dwIndex].pbData,
-                 msg->u.signed_data.info->rgCertEncoded[dwIndex].cbData);
+                ret = CRYPT_CopyParam(pvData, pcbData, cert->pbData, cert->cbData);
         }
         else
             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
@@ -3278,17 +3316,23 @@ static BOOL CDecodeSignedMsg_GetParam(CDecodeMsg *msg, DWORD dwParamType,
     case CMSG_ATTR_CERT_COUNT_PARAM:
         if (msg->u.signed_data.info)
         {
-            DWORD attrCertCount = 0;
+            DWORD count = signed_msg_cert_count(msg->u.signed_data.info, TRUE);
 
-            ret = CRYPT_CopyParam(pvData, pcbData,
-             &attrCertCount, sizeof(DWORD));
+            ret = CRYPT_CopyParam(pvData, pcbData, &count, sizeof(count));
         }
         else
             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
         break;
     case CMSG_ATTR_CERT_PARAM:
         if (msg->u.signed_data.info)
-            SetLastError(CRYPT_E_INVALID_INDEX);
+        {
+            const CERT_BLOB *cert = signed_msg_cert(msg->u.signed_data.info, TRUE, dwIndex);
+
+            if (!cert)
+                SetLastError(CRYPT_E_INVALID_INDEX);
+            else if ((ret = CRYPT_CopyParam(pvData, pcbData, cert->pbData, cert->cbData)) && pvData)
+                *(BYTE *)pvData = ASN_SEQUENCE;  /* the [1]/[2] tag is implicit */
+        }
         else
             SetLastError(CRYPT_E_INVALID_MSG_TYPE);
         break;

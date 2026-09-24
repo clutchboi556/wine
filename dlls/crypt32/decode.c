@@ -5734,6 +5734,12 @@ static BOOL verify_and_copy_certificate(const BYTE *pbEncoded, DWORD cbEncoded, 
 {
     PCCERT_CONTEXT cert;
 
+    /* attribute certificates ([1] v1, [2] v2) are valid CertificateChoices too;
+     * keep them so the rest of the certificate set is still decoded */
+    if (cbEncoded && (pbEncoded[0] == (ASN_CONTEXT | ASN_CONSTRUCTOR | 1) ||
+                      pbEncoded[0] == (ASN_CONTEXT | ASN_CONSTRUCTOR | 2)))
+        return CRYPT_AsnDecodeCopyBytes(pbEncoded, cbEncoded, dwFlags, pvStructInfo, pcbStructInfo, pcbDecoded);
+
     cert = CertCreateCertificateContext(X509_ASN_ENCODING, pbEncoded, cbEncoded);
     if (!cert)
     {
