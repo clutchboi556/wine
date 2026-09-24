@@ -2911,6 +2911,7 @@ typedef struct _CTL_FIND_SUBJECT_PARA
 #define szOID_RSA_SMIMEalgESDH              "1.2.840.113549.1.9.16.3.5"
 #define szOID_RSA_SMIMEalgCMS3DESwrap       "1.2.840.113549.1.9.16.3.6"
 #define szOID_RSA_SMIMEalgCMSRC2wrap        "1.2.840.113549.1.9.16.3.7"
+#define szOID_TIMESTAMP_TOKEN               "1.2.840.113549.1.9.16.1.4"
 #define szOID_RSA_MD2                       "1.2.840.113549.2.2"
 #define szOID_RSA_MD4                       "1.2.840.113549.2.4"
 #define szOID_RSA_MD5                       "1.2.840.113549.2.5"
@@ -3075,6 +3076,7 @@ typedef struct _CTL_FIND_SUBJECT_PARA
 #define szOID_NEXT_UPDATE_LOCATION           "1.3.6.1.4.1.311.10.2"
 #define szOID_KP_CTL_USAGE_SIGNING           "1.3.6.1.4.1.311.10.3.1"
 #define szOID_KP_TIME_STAMP_SIGNING          "1.3.6.1.4.1.311.10.3.2"
+#define szOID_RFC3161_counterSign            "1.3.6.1.4.1.311.3.3.1"
 #ifndef szOID_SERVER_GATED_CRYPTO
 #define szOID_SERVER_GATED_CRYPTO            "1.3.6.1.4.1.311.10.3.3"
 #endif
