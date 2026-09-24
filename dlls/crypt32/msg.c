@@ -2438,6 +2438,28 @@ static BOOL CDecodeMsg_FinalizeEnvelopedContent(CDecodeMsg *msg,
     return CRYPT_ConstructBlob(&msg->u.enveloped_data.content, content);
 }
 
+/* Returns the contents octets of a DER element, i.e. without its identifier
+ * and length octets. */
+static BOOL get_der_contents(const BYTE *data, DWORD size, const BYTE **contents, DWORD *len)
+{
+    DWORD n, i;
+
+    if (size < 2) return FALSE;
+    if (!(data[1] & 0x80))
+    {
+        *len = data[1];
+        *contents = data + 2;
+    }
+    else
+    {
+        n = data[1] & 0x7f;
+        if (!n || n > 4 || size < 2 + n) return FALSE;
+        for (*len = 0, i = 0; i < n; i++) *len = (*len << 8) | data[2 + i];
+        *contents = data + 2 + n;
+    }
+    return *len <= size - (*contents - data);
+}
+
 static BOOL CDecodeMsg_FinalizeSignedContent(CDecodeMsg *msg,
  CRYPT_DER_BLOB *blob)
 {
@@ -2481,6 +2503,22 @@ static BOOL CDecodeMsg_FinalizeSignedContent(CDecodeMsg *msg,
                      rsa_blob->pbData, rsa_blob->cbData, TRUE, Verify);
                     LocalFree(rsa_blob);
                 }
+            }
+            else if (!(msg->base.open_flags & CMSG_DETACHED_FLAG))
+            {
+                const BYTE *data;
+                DWORD len;
+
+                /* The digest covers the contents octets of the content
+                 * (RFC 2315 section 9.3, RFC 5652 section 5.4), e.g. the
+                 * TSTInfo inside an eContent OCTET STRING, or the value of
+                 * an Authenticode SpcIndirectDataContent SEQUENCE. */
+                if (get_der_contents(content->pbData, content->cbData, &data, &len))
+                    ret = CSignedMsgData_Update(&msg->u.signed_data,
+                     data, len, TRUE, Verify);
+                else
+                    ret = CSignedMsgData_Update(&msg->u.signed_data,
+                     content->pbData, content->cbData, TRUE, Verify);
             }
             else
                 ret = CSignedMsgData_Update(&msg->u.signed_data,
