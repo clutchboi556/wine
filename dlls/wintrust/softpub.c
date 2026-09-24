@@ -161,16 +161,18 @@ static DWORD SOFTPUB_GetSIP(CRYPT_PROVIDER_DATA *data)
 /* Assumes data->pPDSip has been loaded, and data->pPDSip->pSip allocated.
  * Calls data->pPDSip->pSip->pfGet to construct data->hMsg.
  */
-static DWORD SOFTPUB_GetMessageFromFile(CRYPT_PROVIDER_DATA *data, HANDLE file,
- LPCWSTR filePath)
+static DWORD SOFTPUB_GetMessage(CRYPT_PROVIDER_DATA *data, HANDLE file,
+ LPCWSTR filePath, const WINTRUST_BLOB_INFO *blob)
 {
     DWORD err = ERROR_SUCCESS;
     BOOL ret;
     LPBYTE buf = NULL;
     DWORD size = 0;
 
-    data->pPDSip->psSipSubjectInfo =
-     data->psPfns->pfnAlloc(sizeof(SIP_SUBJECTINFO));
+    /* The MS_ADDINFO_BLOB, if any, lives in the same allocation so that
+     * SoftpubCleanup frees it along with the subject info. */
+    data->pPDSip->psSipSubjectInfo = data->psPfns->pfnAlloc(
+     sizeof(SIP_SUBJECTINFO) + (blob ? sizeof(MS_ADDINFO_BLOB) : 0));
     if (!data->pPDSip->psSipSubjectInfo)
         return ERROR_OUTOFMEMORY;
 
@@ -179,6 +181,19 @@ static DWORD SOFTPUB_GetMessageFromFile(CRYPT_PROVIDER_DATA *data, HANDLE file,
     data->pPDSip->psSipSubjectInfo->hFile = file;
     data->pPDSip->psSipSubjectInfo->pwsFileName = filePath;
     data->pPDSip->psSipSubjectInfo->hProv = data->hProv;
+    if (blob)
+    {
+        MS_ADDINFO_BLOB *addinfo = (MS_ADDINFO_BLOB *)(data->pPDSip->psSipSubjectInfo + 1);
+
+        addinfo->cbStruct = sizeof(*addinfo);
+        addinfo->cbMemObject = blob->cbMemObject;
+        addinfo->pbMemObject = blob->pbMemObject;
+        addinfo->cbMemSignedMsg = blob->cbMemSignedMsg;
+        addinfo->pbMemSignedMsg = blob->pbMemSignedMsg;
+        data->pPDSip->psSipSubjectInfo->pwsDisplayName = blob->pcwszDisplayName;
+        data->pPDSip->psSipSubjectInfo->dwUnionChoice = MSSIP_ADDINFO_BLOB;
+        data->pPDSip->psSipSubjectInfo->psBlob = addinfo;
+    }
     ret = data->pPDSip->pSip->pfGet(data->pPDSip->psSipSubjectInfo,
      &data->dwEncoding, 0, &size, 0);
     if (!ret)
@@ -207,6 +222,12 @@ static DWORD SOFTPUB_GetMessageFromFile(CRYPT_PROVIDER_DATA *data, HANDLE file,
     data->psPfns->pfnFree(buf);
     TRACE("returning %ld\n", err);
     return err;
+}
+
+static DWORD SOFTPUB_GetMessageFromFile(CRYPT_PROVIDER_DATA *data, HANDLE file,
+ LPCWSTR filePath)
+{
+    return SOFTPUB_GetMessage(data, file, filePath, NULL);
 }
 
 static BOOL hash_file_data( HANDLE file, DWORD start, DWORD end, HCRYPTHASH hash )
@@ -595,6 +616,31 @@ error:
     return err;
 }
 
+/* The object is in memory; the SIP named by gSubject extracts the signed
+ * message from it (e.g. the P7x SIP for AppxSignature.p7x). */
+static DWORD SOFTPUB_LoadBlobMessage(CRYPT_PROVIDER_DATA *data)
+{
+    const WINTRUST_BLOB_INFO *blob = data->pWintrustData->pBlob;
+    DWORD err;
+
+    if (!blob || !WVT_ISINSTRUCT(WINTRUST_BLOB_INFO, blob->cbStruct, pbMemObject) ||
+        !blob->cbMemObject || !blob->pbMemObject)
+        return ERROR_INVALID_PARAMETER;
+
+    GetSystemTimeAsFileTime(&data->sftSystemTime);
+    data->pPDSip->gSubject = blob->gSubject;
+    err = SOFTPUB_GetSIP(data);
+    if (err)
+        return err;
+    err = SOFTPUB_GetMessage(data, NULL, NULL, blob);
+    if (err)
+        return err;
+    err = SOFTPUB_CreateStoreFromMessage(data);
+    if (err)
+        return err;
+    return SOFTPUB_DecodeInnerContent(data);
+}
+
 HRESULT WINAPI SoftpubLoadMessage(CRYPT_PROVIDER_DATA *data)
 {
     DWORD err = ERROR_SUCCESS;
@@ -614,6 +660,9 @@ HRESULT WINAPI SoftpubLoadMessage(CRYPT_PROVIDER_DATA *data)
         break;
     case WTD_CHOICE_CATALOG:
         err = SOFTPUB_LoadCatalogMessage(data);
+        break;
+    case WTD_CHOICE_BLOB:
+        err = SOFTPUB_LoadBlobMessage(data);
         break;
     default:
         FIXME("unimplemented for %ld\n", data->pWintrustData->dwUnionChoice);
