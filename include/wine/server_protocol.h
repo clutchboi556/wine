@@ -2754,11 +2754,15 @@ struct load_registry_request
 {
     struct request_header __header;
     obj_handle_t file;
+    unsigned int flags;
+    unsigned int access;
     /* VARARG(objattr,object_attributes); */
 };
 struct load_registry_reply
 {
     struct reply_header __header;
+    obj_handle_t hkey;
+    char __pad_12[4];
 };
 
 
@@ -7233,6 +7237,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 963
+#define SERVER_PROTOCOL_VERSION 964
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

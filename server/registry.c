@@ -1727,10 +1727,274 @@ static void load_keys( struct key *key, const char *filename, FILE *f, int prefi
     free( info.tmp );
 }
 
+/*
+ * Windows registry hive files ("regf").  Read-only support: the hive is
+ * copied into the key it is loaded on.  All offsets inside hive bins are
+ * relative to the first bin, which starts right after the 4096-byte base
+ * block; a cell is a 32-bit size (negative when allocated) followed by data.
+ */
+
+#define REGF_BASE_BLOCK_SIZE  4096
+#define REGF_MAX_DEPTH        512
+#define REGF_MAX_BIG_DATA     (64 * 1024 * 1024)
+#define REGF_KEY_COMP_NAME    0x0020
+#define REGF_VALUE_COMP_NAME  0x0001
+#define REGF_DATA_INLINE      0x80000000
+#define REGF_BIG_DATA_SEGMENT 16344
+
+struct regf_hive
+{
+    const unsigned char *bins;     /* start of the hive bins */
+    size_t               size;     /* size of the hive bins */
+    unsigned int         minor;    /* minor format version */
+    unsigned int         cells;    /* cells visited so far */
+    unsigned int         max_cells; /* no valid hive has more cells than size / 8, so
+                                       this bounds the work on corrupt (e.g. cyclic) hives */
+};
+
+static inline unsigned int regf_u16( const unsigned char *p ) { return p[0] | (p[1] << 8); }
+static inline unsigned int regf_u32( const unsigned char *p )
+{
+    return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+/* return the data of the allocated cell at offset, or NULL if it is invalid */
+static const unsigned char *regf_cell( struct regf_hive *hive, unsigned int offset, unsigned int *len )
+{
+    int size;
+
+    if (offset > hive->size || hive->size - offset < 4) return NULL;
+    size = (int)regf_u32( hive->bins + offset );
+    if (size >= 0 || size == INT_MIN) return NULL;  /* free cell */
+    size = -size;
+    if (size < 4 || (unsigned int)size > hive->size - offset) return NULL;
+    if (++hive->cells > hive->max_cells) return NULL;
+    *len = size - 4;
+    return hive->bins + offset + 4;
+}
+
+/* convert a hive name (Latin-1 if compressed, else UTF-16LE) */
+static WCHAR *regf_name( const unsigned char *name, unsigned int len, int compressed, int is_key,
+                         data_size_t *ret_len )
+{
+    WCHAR *str;
+    unsigned int i, count = compressed ? len : len / sizeof(WCHAR);
+
+    if (!(str = mem_alloc( count * sizeof(WCHAR) + 1 ))) return NULL;
+    for (i = 0; i < count; i++)
+    {
+        str[i] = compressed ? name[i] : regf_u16( name + 2 * i );
+        if (is_key && str[i] == '\\')  /* not valid in a key name; value names may have it */
+        {
+            free( str );
+            return NULL;
+        }
+    }
+    *ret_len = count * sizeof(WCHAR);
+    return str;
+}
+
+/* return value data in a newly allocated buffer */
+static void *regf_value_data( struct regf_hive *hive, const unsigned char *vk, data_size_t *ret_len )
+{
+    unsigned int size = regf_u32( vk + 4 ), offset = regf_u32( vk + 8 ), len;
+    const unsigned char *cell;
+    unsigned char *data;
+
+    if (size & REGF_DATA_INLINE)
+    {
+        size &= ~REGF_DATA_INLINE;
+        if (size > 4) return NULL;
+        if (!(data = mem_alloc( size + 1 ))) return NULL;
+        memcpy( data, vk + 8, size );
+        *ret_len = size;
+        return data;
+    }
+    if (!size)
+    {
+        *ret_len = 0;
+        return mem_alloc( 1 );
+    }
+    if (!(cell = regf_cell( hive, offset, &len ))) return NULL;
+
+    if (size > REGF_BIG_DATA_SEGMENT && hive->minor >= 4 && len >= 8 && !memcmp( cell, "db", 2 ))
+    {
+        unsigned int i, count = regf_u16( cell + 2 ), done = 0, seg_len;
+        const unsigned char *list, *seg;
+
+        if (size > REGF_MAX_BIG_DATA) return NULL;
+        if (!(list = regf_cell( hive, regf_u32( cell + 4 ), &len )) || len / 4 < count) return NULL;
+        if (!(data = mem_alloc( size ))) return NULL;
+        for (i = 0; i < count && done < size; i++)
+        {
+            unsigned int chunk = min( size - done, REGF_BIG_DATA_SEGMENT );
+
+            if (!(seg = regf_cell( hive, regf_u32( list + 4 * i ), &seg_len )) || seg_len < chunk)
+            {
+                free( data );
+                return NULL;
+            }
+            memcpy( data + done, seg, chunk );
+            done += chunk;
+        }
+        if (done != size)
+        {
+            free( data );
+            return NULL;
+        }
+        *ret_len = size;
+        return data;
+    }
+
+    if (size > len) return NULL;
+    if (!(data = memdup( cell, size ))) return NULL;
+    *ret_len = size;
+    return data;
+}
+
+static void regf_load_values( struct regf_hive *hive, struct key *key, const unsigned char *nk )
+{
+    unsigned int i, count = regf_u32( nk + 36 ), list_len, vk_len, name_len;
+    const unsigned char *list, *vk;
+    struct unicode_str name;
+    data_size_t data_len;
+    void *data;
+    WCHAR *str;
+
+    if (!count) return;
+    if (!(list = regf_cell( hive, regf_u32( nk + 40 ), &list_len )) || list_len / 4 < count) return;
+
+    for (i = 0; i < count; i++)
+    {
+        if (!(vk = regf_cell( hive, regf_u32( list + 4 * i ), &vk_len ))) continue;
+        if (vk_len < 20 || memcmp( vk, "vk", 2 )) continue;
+        name_len = regf_u16( vk + 2 );
+        if (name_len > vk_len - 20) continue;
+        if (!(str = regf_name( vk + 20, name_len, regf_u16( vk + 16 ) & REGF_VALUE_COMP_NAME, 0, &name.len )))
+            continue;
+        name.str = str;
+        if ((data = regf_value_data( hive, vk, &data_len )))
+        {
+            set_value( key, name, regf_u32( vk + 12 ), data, data_len );
+            free( data );
+        }
+        free( str );
+    }
+}
+
+static void regf_load_key( struct regf_hive *hive, struct key *key, unsigned int offset, int depth );
+
+/* walk a subkey list (li, lf, lh, or an ri index of those) */
+static void regf_load_subkeys( struct regf_hive *hive, struct key *key, unsigned int offset, int depth, int allow_ri )
+{
+    unsigned int i, count, len, stride;
+    const unsigned char *list;
+
+    if (!(list = regf_cell( hive, offset, &len )) || len < 4) return;
+    count = regf_u16( list + 2 );
+
+    if (!memcmp( list, "li", 2 )) stride = 4;
+    else if (!memcmp( list, "lf", 2 ) || !memcmp( list, "lh", 2 )) stride = 8;
+    else if (!memcmp( list, "ri", 2 ) && allow_ri)
+    {
+        if ((len - 4) / 4 < count) return;
+        for (i = 0; i < count; i++)
+            regf_load_subkeys( hive, key, regf_u32( list + 4 + 4 * i ), depth, 0 );
+        return;
+    }
+    else return;
+
+    if ((len - 4) / stride < count) return;
+    for (i = 0; i < count; i++)
+        regf_load_key( hive, key, regf_u32( list + 4 + stride * i ), depth );
+}
+
+static void regf_load_key( struct regf_hive *hive, struct key *parent, unsigned int offset, int depth )
+{
+    const unsigned char *nk;
+    struct unicode_str name;
+    struct key *key;
+    unsigned int len, name_len;
+    WCHAR *str;
+
+    if (depth > REGF_MAX_DEPTH) return;
+    if (!(nk = regf_cell( hive, offset, &len )) || len < 76 || memcmp( nk, "nk", 2 )) return;
+    name_len = regf_u16( nk + 72 );
+    if (name_len > len - 76) return;
+    if (!(str = regf_name( nk + 76, name_len, regf_u16( nk + 2 ) & REGF_KEY_COMP_NAME, 1, &name.len ))) return;
+    name.str = str;
+
+    key = name.len ? create_key_recursive( parent, name, current_time ) : NULL;
+    free( str );
+    if (!key)
+    {
+        clear_error();
+        return;
+    }
+    regf_load_values( hive, key, nk );
+    if (regf_u32( nk + 20 )) regf_load_subkeys( hive, key, regf_u32( nk + 28 ), depth + 1, 1 );
+    release_object( key );
+}
+
+/* load a Windows registry hive; the contents of its root key go into key */
+static void load_regf_hive( struct key *key, int fd )
+{
+    unsigned char base[REGF_BASE_BLOCK_SIZE];
+    struct regf_hive hive = { NULL };
+    const unsigned char *root;
+    unsigned char *bins;
+    unsigned int len, root_offset, bins_size;
+    struct stat st;
+
+    if (pread( fd, base, sizeof(base), 0 ) != sizeof(base) || memcmp( base, "regf", 4 ))
+    {
+        set_error( STATUS_NOT_REGISTRY_FILE );
+        return;
+    }
+    if (regf_u32( base + 20 ) != 1 || regf_u32( base + 28 ) != 0 || regf_u32( base + 32 ) != 1)
+    {
+        set_error( STATUS_REGISTRY_CORRUPT );
+        return;
+    }
+    if (regf_u32( base + 4 ) != regf_u32( base + 8 ))
+        fprintf( stderr, "wineserver: registry hive was not cleanly saved, loading it anyway\n" );
+
+    root_offset = regf_u32( base + 36 );
+    bins_size = regf_u32( base + 40 );
+    if (fstat( fd, &st ) == -1 || st.st_size < REGF_BASE_BLOCK_SIZE ||
+        bins_size > st.st_size - REGF_BASE_BLOCK_SIZE)
+    {
+        set_error( STATUS_REGISTRY_CORRUPT );
+        return;
+    }
+    if (!(bins = mem_alloc( bins_size ? bins_size : 1 ))) return;
+    if (pread( fd, bins, bins_size, REGF_BASE_BLOCK_SIZE ) != bins_size)
+    {
+        free( bins );
+        set_error( STATUS_REGISTRY_IO_FAILED );
+        return;
+    }
+
+    hive.bins = bins;
+    hive.size = bins_size;
+    hive.minor = regf_u32( base + 24 );
+    hive.max_cells = bins_size / 8;
+
+    if ((root = regf_cell( &hive, root_offset, &len )) && len >= 76 && !memcmp( root, "nk", 2 ))
+    {
+        regf_load_values( &hive, key, root );
+        if (regf_u32( root + 20 )) regf_load_subkeys( &hive, key, regf_u32( root + 28 ), 1, 1 );
+    }
+    else set_error( STATUS_REGISTRY_CORRUPT );
+
+    free( bins );
+}
+
 /* load a part of the registry from a file */
 static void load_registry( struct key *key, obj_handle_t handle )
 {
     struct file *file;
+    char magic[4];
     int fd;
 
     if (!(file = get_file_obj( current->process, handle, FILE_READ_DATA ))) return;
@@ -1738,8 +2002,15 @@ static void load_registry( struct key *key, obj_handle_t handle )
     release_object( file );
     if (fd != -1)
     {
-        FILE *f = fdopen( fd, "r" );
-        if (f)
+        FILE *f;
+
+        if (pread( fd, magic, sizeof(magic), 0 ) == sizeof(magic) && !memcmp( magic, "regf", 4 ))
+        {
+            load_regf_hive( key, fd );
+            close( fd );
+            return;
+        }
+        if ((f = fdopen( fd, "r" )))
         {
             load_keys( key, NULL, f, -1 );
             fclose( f );
@@ -2300,7 +2571,8 @@ DECL_HANDLER(load_registry)
     if (!get_req_object_attributes( &params )) return;
     if (params.root) release_object( params.root );
 
-    if (!thread_single_check_privilege( current, SeRestorePrivilege ))
+    /* application hives (RegLoadAppKey) need no privilege */
+    if (!(req->flags & REG_APP_HIVE) && !thread_single_check_privilege( current, SeRestorePrivilege ))
     {
         set_error( STATUS_PRIVILEGE_NOT_HELD );
         return;
@@ -2314,6 +2586,8 @@ DECL_HANDLER(load_registry)
     if ((key = create_named_object( &params )))
     {
         load_registry( key, req->file );
+        if (!get_error() && (req->flags & REG_APP_HIVE))
+            reply->hkey = alloc_handle( current->process, key, req->access ? req->access : KEY_ALL_ACCESS, 0 );
         release_object( key );
     }
     if (parent) release_object( parent );

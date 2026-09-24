@@ -191,15 +191,18 @@ NTSTATUS WINAPI wow64_NtLoadKeyEx( UINT *args )
     HANDLE trustkey = get_handle( &args );
     HANDLE event = get_handle( &args );
     ACCESS_MASK desired_access = get_ulong( &args );
-    HANDLE *rootkey = get_ptr( &args );
+    ULONG *rootkey32 = get_ptr( &args );
     IO_STATUS_BLOCK32 *io32 = get_ptr( &args );
 
     struct object_attr64 attr, file;
     IO_STATUS_BLOCK io;
+    HANDLE rootkey = 0;
     NTSTATUS status;
 
     status = NtLoadKeyEx( objattr_32to64( &attr, attr32 ), objattr_32to64( &file, file32 ), flags,
-                        trustkey, event, desired_access, rootkey, iosb_32to64( &io, io32 ) );
+                        trustkey, event, desired_access, rootkey32 ? &rootkey : NULL,
+                        iosb_32to64( &io, io32 ) );
+    if (rootkey32) put_handle( rootkey32, rootkey );
     put_iosb( io32, &io );
     return status;
 }
