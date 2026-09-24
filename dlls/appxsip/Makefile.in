@@ -1,0 +1,5 @@
+MODULE    = appxsip.dll
+IMPORTS   = crypt32
+
+SOURCES = \
+	main.c

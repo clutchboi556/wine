@@ -1,0 +1,8 @@
+@ stdcall -private DllRegisterServer()
+@ stdcall -private DllUnregisterServer()
+@ stdcall P7xSipCreateIndirectData(ptr ptr ptr)
+@ stdcall P7xSipGetSignedDataMsg(ptr ptr long ptr ptr)
+@ stdcall P7xSipIsFileSupportedName(wstr ptr)
+@ stdcall P7xSipPutSignedDataMsg(ptr long ptr long ptr)
+@ stdcall P7xSipRemoveSignedDataMsg(ptr long)
+@ stdcall P7xSipVerifyIndirectData(ptr ptr)
