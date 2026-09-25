@@ -644,7 +644,12 @@ BOOL WINAPI WTSQuerySessionInformationW(HANDLE server, DWORD session_id, WTS_INF
  */
 BOOL WINAPI WTSQueryUserToken(ULONG session_id, PHANDLE token)
 {
-    FIXME("%lu %p semi-stub!\n", session_id, token);
+    TOKEN_PRIVILEGES privs = { 1, {{ { SE_TCB_PRIVILEGE, 0 }, SE_PRIVILEGE_ENABLED }} }, old_privs;
+    HANDLE process_token;
+    DWORD size;
+    BOOL ret, adjusted;
+
+    TRACE("%lu %p\n", session_id, token);
 
     if (!token)
     {
@@ -652,9 +657,30 @@ BOOL WINAPI WTSQueryUserToken(ULONG session_id, PHANDLE token)
         return FALSE;
     }
 
-    return DuplicateHandle(GetCurrentProcess(), GetCurrentProcessToken(),
-                           GetCurrentProcess(), token,
-                           0, FALSE, DUPLICATE_SAME_ACCESS);
+    /* there is only one user; hand out a primary token for the requested session */
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                          &process_token))
+        return FALSE;
+    if (!(ret = DuplicateTokenEx(process_token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation,
+                                 TokenPrimary, token)))
+    {
+        CloseHandle(process_token);
+        return FALSE;
+    }
+
+    size = sizeof(old_privs);
+    adjusted = AdjustTokenPrivileges(process_token, FALSE, &privs, sizeof(old_privs), &old_privs, &size);
+    ret = SetTokenInformation(*token, TokenSessionId, &session_id, sizeof(session_id));
+    if (adjusted) AdjustTokenPrivileges(process_token, FALSE, &old_privs, 0, NULL, NULL);
+    CloseHandle(process_token);
+
+    if (!ret)
+    {
+        CloseHandle(*token);
+        *token = NULL;
+        SetLastError(ERROR_NO_TOKEN);
+    }
+    return ret;
 }
 
 /************************************************************
