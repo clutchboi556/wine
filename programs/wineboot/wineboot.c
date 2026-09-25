@@ -1443,7 +1443,7 @@ static int ProcessWindowsFileProtection(void)
     return 1;
 }
 
-static BOOL create_native_process( const WCHAR *app, WCHAR *cmdline, BOOL inherit, DWORD flags,
+static BOOL create_native_process( HANDLE token, const WCHAR *app, WCHAR *cmdline, BOOL inherit, DWORD flags,
                                    const WCHAR *curdir, PROCESS_INFORMATION *info )
 {
     struct _PROC_THREAD_ATTRIBUTE_LIST *list;
@@ -1456,20 +1456,51 @@ static BOOL create_native_process( const WCHAR *app, WCHAR *cmdline, BOOL inheri
     InitializeProcThreadAttributeList( list, 1, 0, &size );
     UpdateProcThreadAttribute( list, 0, PROC_THREAD_ATTRIBUTE_MACHINE_TYPE,
                                &machine, sizeof(machine), NULL, NULL );
-    ret = CreateProcessW( app, cmdline, NULL, NULL, inherit,
-                          EXTENDED_STARTUPINFO_PRESENT | flags, NULL, curdir, &si.StartupInfo, info );
+    if (token)
+        ret = CreateProcessAsUserW( token, app, cmdline, NULL, NULL, inherit,
+                                    EXTENDED_STARTUPINFO_PRESENT | flags, NULL, curdir, &si.StartupInfo, info );
+    else
+        ret = CreateProcessW( app, cmdline, NULL, NULL, inherit,
+                              EXTENDED_STARTUPINFO_PRESENT | flags, NULL, curdir, &si.StartupInfo, info );
     free( list );
     return ret;
+}
+
+/* Services run in session 0, apart from the interactive session. */
+static HANDLE create_session0_token(void)
+{
+    TOKEN_PRIVILEGES privs = { 1, {{ { SE_TCB_PRIVILEGE, 0 }, SE_PRIVILEGE_ENABLED }} };
+    HANDLE token, dup = NULL;
+    DWORD session = 0;
+
+    if (!OpenProcessToken( GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token ))
+        return NULL;
+    AdjustTokenPrivileges( token, FALSE, &privs, 0, NULL, NULL );
+    if (DuplicateTokenEx( token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &dup ) &&
+        !SetTokenInformation( dup, TokenSessionId, &session, sizeof(session) ))
+    {
+        WINE_WARN( "failed to set the session of the services token: %lu\n", GetLastError() );
+        CloseHandle( dup );
+        dup = NULL;
+    }
+    privs.Privileges[0].Attributes = 0;
+    AdjustTokenPrivileges( token, FALSE, &privs, 0, NULL, NULL );
+    CloseHandle( token );
+    return dup;
 }
 
 static BOOL start_services_process(void)
 {
     static const WCHAR svcctl_started_event[] = SVCCTL_STARTED_EVENT;
     PROCESS_INFORMATION pi;
-    HANDLE wait_handles[2];
+    HANDLE wait_handles[2], token;
+    BOOL ret;
 
-    if (!create_native_process( L"C:\\windows\\system32\\services.exe", NULL,
-                                TRUE, DETACHED_PROCESS, L"C:\\windows\\system32", &pi))
+    token = create_session0_token();
+    ret = create_native_process( token, L"C:\\windows\\system32\\services.exe", NULL,
+                                 TRUE, DETACHED_PROCESS, L"C:\\windows\\system32", &pi );
+    if (token) CloseHandle( token );
+    if (!ret)
     {
         WINE_ERR("Couldn't start services.exe: error %lu\n", GetLastError());
         return FALSE;
@@ -1572,7 +1603,7 @@ static HANDLE start_rundll32( const WCHAR *inf_path, const WCHAR *install, WORD 
     swprintf( buffer, len, L"%s setupapi,InstallHinfSection %s 128 %s", app, install, inf_path );
 
     if (machine == IMAGE_FILE_MACHINE_TARGET_HOST)
-        ret = create_native_process( app, buffer, FALSE, 0, NULL, &pi );
+        ret = create_native_process( NULL, app, buffer, FALSE, 0, NULL, &pi );
     else
         ret = CreateProcessW( app, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi );
 
@@ -1857,7 +1888,7 @@ int __cdecl main( int argc, char *argv[] )
         wcscat( filename, L"\\wineboot.exe" );
 
         Wow64DisableWow64FsRedirection( &redir );
-        if (create_native_process( filename, GetCommandLineW(), FALSE, 0, NULL, &pi ))
+        if (create_native_process( NULL, filename, GetCommandLineW(), FALSE, 0, NULL, &pi ))
         {
             WINE_TRACE( "restarting %s\n", wine_dbgstr_w(filename) );
             WaitForSingleObject( pi.hProcess, INFINITE );
