@@ -1596,6 +1596,29 @@ DECL_HANDLER(set_token_default_dacl)
     }
 }
 
+/* set the session of a token; like on Windows this needs the TCB privilege */
+DECL_HANDLER(set_token_session_id)
+{
+    struct token *token;
+
+    if (req->session_id != 0 && req->session_id != default_session_id)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (!thread_single_check_privilege( current, SeTcbPrivilege ))
+    {
+        set_error( STATUS_PRIVILEGE_NOT_HELD );
+        return;
+    }
+    if ((token = (struct token *)get_handle_obj( current->process, req->handle,
+                                                 TOKEN_ADJUST_SESSIONID, &token_ops )))
+    {
+        token->session_id = req->session_id;
+        release_object( token );
+    }
+}
+
 DECL_HANDLER(create_linked_token)
 {
     struct token *token, *linked;
