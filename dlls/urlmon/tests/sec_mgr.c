@@ -654,6 +654,26 @@ static void test_polices(void)
  * when urlmon.dll is loaded and it doesn't seem to update its cache, unless
  * SetZoneMapping is used.
  */
+/* when no security URL can be determined, the URL itself is mapped */
+static void test_MapUrlToZone_unresolved_security_url(void)
+{
+    IInternetSecurityManager *secmgr;
+    DWORD zone;
+    HRESULT hres;
+
+    hres = pCoInternetCreateSecurityManager(NULL, &secmgr, 0);
+    ok(hres == S_OK, "CoInternetCreateSecurityManager failed: %08lx\n", hres);
+    if(FAILED(hres))
+        return;
+
+    zone = 0xdeadbeef;
+    hres = IInternetSecurityManager_MapUrlToZone(secmgr, L"res:///%25notamodule%25.dll/$10/$RCDATA_16_ITEM", &zone, 0);
+    ok(hres == S_OK, "MapUrlToZone failed: %08lx\n", hres);
+    ok(zone != URLZONE_INVALID && zone != 0xdeadbeef, "got zone %ld\n", zone);
+
+    IInternetSecurityManager_Release(secmgr);
+}
+
 static void test_zone_domain_cache(void)
 {
     HRESULT hres;
@@ -2445,6 +2465,7 @@ START_TEST(sec_mgr)
     }
 
     test_SecurityManager();
+    test_MapUrlToZone_unresolved_security_url();
     test_SecurityManagerEx2();
     test_polices();
     test_zone_domains();

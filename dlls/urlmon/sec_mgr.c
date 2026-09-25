@@ -447,9 +447,12 @@ static HRESULT get_zone_from_domains(IUri *uri, DWORD *zone)
         return hres;
 
     /* Known hierarchical scheme types must have a host. If they don't Windows
-     * assigns URLZONE_INVALID to the zone.
+     * assigns URLZONE_INVALID to the zone. For res: what follows the slashes
+     * is a module path rather than a host, and res:/// URLs whose module the
+     * protocol handler could not resolve still get a zone.
      */
-    if((scheme_type != URL_SCHEME_UNKNOWN && scheme_type != URL_SCHEME_FILE)
+    if((scheme_type != URL_SCHEME_UNKNOWN && scheme_type != URL_SCHEME_FILE &&
+        scheme_type != URL_SCHEME_RES)
         && is_hierarchical_scheme(scheme_type) && !*host) {
         *zone = URLZONE_INVALID;
 
@@ -564,7 +567,7 @@ static HRESULT map_url_to_zone(LPCWSTR url, DWORD *zone, LPWSTR *ret_url)
 
     hres = CoInternetGetSecurityUrl(url, &secur_url, PSU_SECURITY_URL_ONLY, 0);
     if(hres != S_OK) {
-        DWORD size = lstrlenW(url)*sizeof(WCHAR);
+        DWORD size = (lstrlenW(url)+1)*sizeof(WCHAR);
 
         secur_url = CoTaskMemAlloc(size);
         if(!secur_url)
