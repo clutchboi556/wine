@@ -7341,6 +7341,49 @@ static void test_token_label(void)
     CloseHandle(token);
 }
 
+static void test_token_session_id(void)
+{
+    TOKEN_PRIVILEGES privs = { 1, {{ { SE_TCB_PRIVILEGE, 0 }, SE_PRIVILEGE_ENABLED }} }, old_privs;
+    HANDLE token, dup;
+    DWORD session, size, orig;
+    BOOL ret;
+
+    ret = OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &token);
+    ok(ret, "OpenProcessToken failed: %lu\n", GetLastError());
+    ret = DuplicateTokenEx(token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &dup);
+    ok(ret, "DuplicateTokenEx failed: %lu\n", GetLastError());
+
+    ret = GetTokenInformation(dup, TokenSessionId, &orig, sizeof(orig), &size);
+    ok(ret, "GetTokenInformation failed: %lu\n", GetLastError());
+
+    /* changing the session needs the TCB privilege enabled */
+    session = 0;
+    SetLastError(0xdeadbeef);
+    ret = SetTokenInformation(dup, TokenSessionId, &session, sizeof(session));
+    ok(!ret && GetLastError() == ERROR_PRIVILEGE_NOT_HELD, "got %d, error %lu\n", ret, GetLastError());
+
+    size = sizeof(old_privs);
+    AdjustTokenPrivileges(token, FALSE, &privs, sizeof(old_privs), &old_privs, &size);
+    if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+    {
+        skip("SeTcbPrivilege is not held\n");
+        CloseHandle(dup);
+        CloseHandle(token);
+        return;
+    }
+
+    session = orig ? 0 : 1;
+    ret = SetTokenInformation(dup, TokenSessionId, &session, sizeof(session));
+    ok(ret, "SetTokenInformation failed: %lu\n", GetLastError());
+    session = 0xdeadbeef;
+    ret = GetTokenInformation(dup, TokenSessionId, &session, sizeof(session), &size);
+    ok(ret && session == (orig ? 0 : 1), "got session %lu\n", session);
+
+    AdjustTokenPrivileges(token, FALSE, &old_privs, 0, NULL, NULL);
+    CloseHandle(dup);
+    CloseHandle(token);
+}
+
 static void test_token_security_descriptor(void)
 {
     static SID low_level = {SID_REVISION, 1, {SECURITY_MANDATORY_LABEL_AUTHORITY},
@@ -8941,4 +8984,5 @@ START_TEST(security)
 
     /* Must be the last test, modifies process token */
     test_token_security_descriptor();
+    test_token_session_id();
 }

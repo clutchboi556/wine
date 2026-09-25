@@ -3608,6 +3608,12 @@ enum caret_state
     VARARG(acl,acl);            /* access control list */
 @END
 
+/* Set the session id of a token */
+@REQ(set_token_session_id)
+    obj_handle_t  handle;        /* handle to the token */
+    unsigned int  session_id;    /* new session id */
+@END
+
 @REQ(set_token_default_dacl)
     obj_handle_t    handle;     /* handle to the token */
     VARARG(acl,acl);            /* default dacl to set */
