@@ -2268,6 +2268,12 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case WM_WINE_SETPIXELFORMAT:
         set_window_pixel_format( hwnd, wparam, lparam );
         return 0;
+    case WM_WINE_EMBED_FLUSH:
+        present_embedded_window( hwnd, (HWND)wparam, (HANDLE)lparam );
+        return 0;
+    case WM_WINE_EMBED_SETCURSOR:
+        set_embedded_window_cursor( hwnd, (HCURSOR)wparam, (HANDLE)lparam );
+        return 0;
     case WM_WINE_TRACKMOUSEEVENT:
     {
         TRACKMOUSEEVENT info;

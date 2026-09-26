@@ -2199,11 +2199,21 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
     return TRUE;
 }
 
+/* the top-level window of another process that a child window is drawn into, when the
+ * driver can't do that itself (see create_embed_window_surface) */
+static HWND get_embedding_window( HWND hwnd, HWND parent )
+{
+    if (!parent || parent == get_desktop_window()) return 0;
+    if (is_current_process_window( parent )) return 0;
+    if (display_driver_draws_other_processes()) return 0;
+    return NtUserGetAncestor( parent, GA_ROOT );
+}
+
 static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
                                                   struct window_rects *rects, RECT *surface_rect )
 {
     BOOL shaped, needs_surface, create_opaque, is_layered, is_child;
-    HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+    HWND parent = NtUserGetAncestor( hwnd, GA_PARENT ), embedding;
     struct window_surface *new_surface;
     struct window_rects monitor_rects;
     struct ratio raw_dpi;
@@ -2214,6 +2224,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     is_child = parent && parent != NtUserGetDesktopWindow();
+    embedding = is_child ? get_embedding_window( hwnd, parent ) : 0;
 
     if (is_child) get_win_monitor_dpi( parent, &raw_dpi );
     else monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
@@ -2226,7 +2237,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child) needs_surface = FALSE;
+    else if (is_child && !embedding) needs_surface = FALSE;
     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
     else needs_surface = !!(style & WS_VISIBLE);
@@ -2248,7 +2259,9 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     if (IsRectEmpty( surface_rect )) needs_surface = FALSE;
     else if (create_layered || is_layered) needs_surface = TRUE;
 
-    if (needs_surface)
+    if (needs_surface && embedding)
+        create_embed_window_surface( hwnd, embedding, surface_rect, &new_surface );
+    else if (needs_surface)
         create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
     else if (new_surface && new_surface != &dummy_surface)
     {

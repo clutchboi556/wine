@@ -1055,6 +1055,21 @@ user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y )
     return desktop->top_window->handle;
 }
 
+/* return the window of another process embedded in a window under a point (in absolute raw coords),
+ * or the window itself: that window's thread, not the host's, decides the cursor over it */
+user_handle_t embedded_window_from_point( user_handle_t handle, int x, int y )
+{
+    struct window *win = get_user_object( handle, NTUSER_OBJ_WINDOW ), *child;
+
+    if (!win || !win->thread || is_desktop_window( win )) return handle;
+
+    map_point_raw_to_virt( win->desktop, &x, &y );
+    screen_to_client( win, &x, &y, no_dpi );
+    child = child_window_from_point( win, x, y );
+    if (child->thread && child->thread->process != win->thread->process) return child->handle;
+    return handle;
+}
+
 /* return thread of top-most window containing point (in absolute raw coords) */
 struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
 {

@@ -50,6 +50,12 @@ extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *s
 extern struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi );
 extern void erase_now( HWND hwnd, UINT rdw_flags );
 extern void flush_window_surfaces( BOOL idle );
+extern void create_embed_window_surface( HWND hwnd, HWND top, const RECT *surface_rect,
+                                         struct window_surface **window_surface );
+extern void present_embedded_window( HWND top, HWND hwnd, HANDLE section );
+extern BOOL display_driver_draws_other_processes(void);
+extern HANDLE share_section( HANDLE section, HWND hwnd );
+extern void set_embedded_window_cursor( HWND top, HCURSOR remote, HANDLE section );
 extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
 extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
                                       const RECT *old_visible_rect, const RECT *valid_rects );

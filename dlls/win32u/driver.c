@@ -1056,6 +1056,13 @@ static const struct user_driver_funcs *load_driver(void)
     return user_driver;
 }
 
+/* whether the driver can draw into windows of other processes (it needs a GetDC entry point
+ * for that); if not, such windows get embedded surfaces */
+BOOL display_driver_draws_other_processes(void)
+{
+    return load_driver()->pGetDC != nulldrv_GetDC;
+}
+
 void init_display_driver(void)
 {
     if (user_driver == &lazy_load_driver) load_display_driver();
