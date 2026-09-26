@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <math.h>
 #include <assert.h>
 
 #include "ntstatus.h"
@@ -405,9 +406,39 @@ done:
     return hr;
 }
 
-static void do_composite_dxgi_surface(const struct composition_target *target,
-                                      const struct composition_visual *visual,
-                                      IDXGISurface *dxgi_surface)
+/* Keep the cached copy of the visual's content as a DIB section of the given size. */
+static BOOL visual_resize_cache(struct composition_visual *visual, UINT width, UINT height)
+{
+    BITMAPINFO info = {{sizeof(info.bmiHeader)}};
+    void *bits;
+
+    if (visual->cache.dc && visual->cache.width == width && visual->cache.height == height)
+        return TRUE;
+
+    visual_free_cache(visual);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -(LONG)height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    if (!(visual->cache.dc = CreateCompatibleDC(0)))
+        return FALSE;
+    if (!(visual->cache.bitmap = CreateDIBSection(visual->cache.dc, &info, DIB_RGB_COLORS, &bits, NULL, 0)))
+    {
+        DeleteDC(visual->cache.dc);
+        visual->cache.dc = NULL;
+        return FALSE;
+    }
+    visual->cache.old_bitmap = SelectObject(visual->cache.dc, visual->cache.bitmap);
+    visual->cache.width = width;
+    visual->cache.height = height;
+    return TRUE;
+}
+
+/* Read the surface back from the GPU into the visual's cache. */
+static HRESULT update_visual_cache(const struct composition_target *target,
+                                   struct composition_visual *visual,
+                                   IDXGISurface *dxgi_surface)
 {
     ID3DDeviceContextState *state = NULL, *old_state = NULL;
     ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
@@ -420,18 +451,9 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     DXGI_SURFACE_DESC surface_desc;
     ID2D1Bitmap *src_bitmap = NULL;
     ID2D1Image *old_target = NULL;
-    HDC dst_dc, src_dc;
     D2D1_SIZE_U size;
-    DWORD style;
-    HRESULT hr;
-
-    static const BLENDFUNCTION blend_func =
-    {
-      AC_SRC_OVER, /* BlendOp */
-      0,           /* BlendFlag */
-      255,         /* SourceConstantAlpha */
-      AC_SRC_ALPHA /* AlphaFormat */
-    };
+    HRESULT hr = E_FAIL;
+    HDC src_dc;
 
     static const D3D_FEATURE_LEVEL feature_levels[] =
     {
@@ -504,6 +526,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     else if (surface_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
     {
         ERR("DXGI_FORMAT_R16G16B16A16_FLOAT surface is currently unsupported.\n");
+        hr = E_NOTIMPL;
         goto done;
     }
 
@@ -549,12 +572,10 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
         goto done;
     }
 
-    style = DCX_USESTYLE | DCX_CACHE;
-    if (!target->topmost)
-        style |= DCX_CLIPCHILDREN;
-    dst_dc = GetDCEx(target->hwnd, 0, style);
-    GdiAlphaBlend(dst_dc, 0, 0, size.width, size.height, src_dc, 0, 0, size.width, size.height, blend_func);
-    ReleaseDC(target->hwnd, dst_dc);
+    if (visual_resize_cache(visual, size.width, size.height))
+        BitBlt(visual->cache.dc, 0, 0, size.width, size.height, src_dc, 0, 0, SRCCOPY);
+    else
+        hr = E_OUTOFMEMORY;
 
     ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, NULL);
     ID2D1DeviceContext_SetTarget(visual->device_context, old_target);
@@ -586,6 +607,52 @@ done:
         ID3D11DeviceContext_Release(d3d11_device_context);
     if (d3d11_device)
         ID3D11Device1_Release(d3d11_device);
+    return hr;
+}
+
+/* Where a visual lands in the target window: the translation accumulated from the
+ * root, and the clip accumulated from the root, both in window coordinates. */
+struct composite_state
+{
+    float x, y;
+    RECT clip;
+};
+
+static LONG clamp_coord(float value)
+{
+    if (value <= -1e9f) return -1000000000;
+    if (value >= 1e9f) return 1000000000;
+    return (LONG)floorf(value + 0.5f);
+}
+
+static void blit_visual_cache(const struct composition_target *target, const struct composition_visual *visual,
+                              const struct composite_state *state)
+{
+    LONG x = clamp_coord(state->x), y = clamp_coord(state->y);
+    RECT rect;
+    HDC dst_dc;
+    DWORD style;
+
+    static const BLENDFUNCTION blend_func =
+    {
+      AC_SRC_OVER, /* BlendOp */
+      0,           /* BlendFlag */
+      255,         /* SourceConstantAlpha */
+      AC_SRC_ALPHA /* AlphaFormat */
+    };
+
+    style = DCX_USESTYLE | DCX_CACHE;
+    if (!target->topmost)
+        style |= DCX_CLIPCHILDREN;
+    SetRect(&rect, x, y, x + visual->cache.width, y + visual->cache.height);
+    if (!IntersectRect(&rect, &rect, &state->clip))
+        return;
+
+    dst_dc = GetDCEx(target->hwnd, 0, style);
+    GdiAlphaBlend(dst_dc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                  visual->cache.dc, rect.left - x, rect.top - y, rect.right - rect.left,
+                  rect.bottom - rect.top, blend_func);
+    ReleaseDC(target->hwnd, dst_dc);
 }
 
 static struct composition_visual * shared_visual_target_get_root(HANDLE shared_visual_handle)
@@ -607,17 +674,33 @@ static struct composition_visual * shared_visual_target_get_root(HANDLE shared_v
     return visual;
 }
 
-static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual)
+static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual,
+                            const struct composite_state *parent_state)
 {
     struct composition_visual *child_visual;
-    IDXGISurface *dxgi_surface;
+    struct composite_state state = *parent_state;
+    IDXGISurface *dxgi_surface = NULL;
+    UINT content_version = 0;
     HRESULT hr;
+
+    /* The visual's transform is applied before its offset; only translations are supported. */
+    state.x += visual->offset_x + visual->transform._31;
+    state.y += visual->offset_y + visual->transform._32;
+    if (visual->has_clip)
+    {
+        RECT clip;
+
+        SetRect(&clip, clamp_coord(state.x + visual->clip.left), clamp_coord(state.y + visual->clip.top),
+                clamp_coord(state.x + visual->clip.right), clamp_coord(state.y + visual->clip.bottom));
+        if (!IntersectRect(&state.clip, &state.clip, &clip))
+            return S_OK;
+    }
 
     if (visual->shared_visual_handle)
     {
         struct composition_visual *root = shared_visual_target_get_root(visual->shared_visual_handle);
         if (root)
-            do_composite(target, root);
+            do_composite(target, root, &state);
     }
 
     /* Render content */
@@ -643,16 +726,25 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
                 return hr;
             }
 
+            /* Only a Present() changes what the swapchain shows. */
+            if (FAILED(IDXGISwapChain1_GetLastPresentCount(swapchain, &content_version)))
+                content_version = ~0u;
+
             /* The front buffer is the last back buffer because the composition swapchain must
                      * be created with DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL */
-            hr = IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_IDXGISurface,
-                                           (void **)&dxgi_surface);
-            IDXGISwapChain1_Release(swapchain);
-            if (FAILED(hr))
+            if (!visual->cache.content || visual->cache.content != visual->content
+                    || visual->cache.content_version != content_version || content_version == ~0u)
             {
-                ERR("Failed to get the swapchain front buffer, hr %#lx.\n", hr);
-                return hr;
+                hr = IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_IDXGISurface,
+                                               (void **)&dxgi_surface);
+                if (FAILED(hr))
+                {
+                    ERR("Failed to get the swapchain front buffer, hr %#lx.\n", hr);
+                    IDXGISwapChain1_Release(swapchain);
+                    return hr;
+                }
             }
+            IDXGISwapChain1_Release(swapchain);
         }
         else if (IsEqualGUID(&visual->content_iid, &IID_IDCompositionSurface))
         {
@@ -669,8 +761,14 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
             surface_impl = impl_from_IDCompositionSurface(surface);
             if (IsEqualGUID(&surface_impl->physical_surface_iid, &IID_IDXGISurface))
             {
-                dxgi_surface = (IDXGISurface *)surface_impl->physical_surface;
-                IDXGISurface_AddRef(dxgi_surface);
+                /* Only EndDraw() changes what the surface shows. */
+                content_version = ReadAcquire(&surface_impl->draw_count);
+                if (!visual->cache.content || visual->cache.content != visual->content
+                        || visual->cache.content_version != content_version)
+                {
+                    dxgi_surface = (IDXGISurface *)surface_impl->physical_surface;
+                    IDXGISurface_AddRef(dxgi_surface);
+                }
                 IDCompositionSurface_Release(surface);
             }
             else
@@ -687,13 +785,28 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
             return E_FAIL;
         }
 
-        do_composite_dxgi_surface(target, visual, dxgi_surface);
-        IDXGISurface_Release(dxgi_surface);
+        if (dxgi_surface)
+        {
+            /* Reading the surface back holds the rendering device's lock; skip it when
+             * the content did not change and repaint the window from the cache. */
+            if (SUCCEEDED(update_visual_cache(target, visual, dxgi_surface)))
+            {
+                visual->cache.content = visual->content;
+                visual->cache.content_version = content_version;
+            }
+            else
+            {
+                visual->cache.content = NULL;
+            }
+            IDXGISurface_Release(dxgi_surface);
+        }
+        if (visual->cache.content)
+            blit_visual_cache(target, visual, &state);
     }
 
     LIST_FOR_EACH_ENTRY(child_visual, &visual->child_visuals, struct composition_visual, entry)
     {
-        do_composite(target, child_visual);
+        do_composite(target, child_visual, &state);
     }
 
     return S_OK;
@@ -706,6 +819,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
     unsigned int count, frequency, refresh_period;
     struct composition_target *target;
     struct composition_visual *visual;
+    struct composite_state state;
     HDC hdc;
 
     /* TODO: Implement and use D3DKMTWaitForVerticalBlankEvent() */
@@ -733,7 +847,9 @@ static DWORD WINAPI composite_thread_proc(void *iface)
                 continue;
 
             visual = impl_from_IDCompositionVisual(target->root);
-            if (SUCCEEDED(do_composite(target, visual)))
+            state.x = state.y = 0.0f;
+            GetClientRect(target->hwnd, &state.clip);
+            if (SUCCEEDED(do_composite(target, visual, &state)))
                 count++;
         }
 

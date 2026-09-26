@@ -58,6 +58,7 @@ struct composition_surface
     UINT height;
     DXGI_FORMAT pixel_format;
     DXGI_ALPHA_MODE alpha_mode;
+    LONG draw_count;
     LONG ref;
 };
 
@@ -84,6 +85,12 @@ struct composition_visual
     enum DCOMPOSITION_BORDER_MODE border_mode;
     enum DCOMPOSITION_BACKFACE_VISIBILITY visibility;
     float offset_x;
+    float offset_y;
+    D2D_MATRIX_3X2_F transform;
+    BOOL has_clip;
+    D2D_RECT_F clip;
+    enum DCOMPOSITION_COMPOSITE_MODE composite_mode;
+    enum DCOMPOSITION_OPACITY_MODE opacity_mode;
     struct list child_visuals; /* visuals closer to head are lower in z-order */
     struct list entry;
     struct composition_visual *parent;
@@ -91,6 +98,17 @@ struct composition_visual
     BOOL is_child;
     HANDLE shared_visual_handle;
     int version;
+    /* The last composited content, so it is read back from the GPU only when it changes */
+    struct
+    {
+        HDC dc;
+        HBITMAP bitmap;
+        HGDIOBJ old_bitmap;
+        UINT width;
+        UINT height;
+        IUnknown *content;
+        UINT content_version;
+    } cache;
     LONG ref;
 };
 
@@ -136,6 +154,7 @@ static inline struct composition_visual *impl_from_IDCompositionVisualUnknown(ID
     return CONTAINING_RECORD(iface, struct composition_visual, IDCompositionVisualUnknown_iface);
 }
 
+void visual_free_cache(struct composition_visual *visual);
 void dcomp_lock(void);
 void dcomp_unlock(void);
 HRESULT create_surface(struct composition_surface_factory *factory, UINT width, UINT height,

@@ -246,6 +246,7 @@ static HRESULT STDMETHODCALLTYPE surface_EndDraw(IDCompositionSurfaceUnknown *if
     ID3D11Device_Release(d3d11_device);
 
     SetRectEmpty(&surface->draw_rect);
+    InterlockedIncrement(&surface->draw_count);
     return S_OK;
 }
 

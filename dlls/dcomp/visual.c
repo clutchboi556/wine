@@ -18,10 +18,12 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <string.h>
 
 #define COBJMACROS
 #include "windef.h"
 #include "winbase.h"
+#include "wingdi.h"
 #include "dcomp_private.h"
 #include "wine/debug.h"
 
@@ -58,6 +60,17 @@ static ULONG STDMETHODCALLTYPE visual_AddRef(IDCompositionVisualUnknown *iface)
     return ref;
 }
 
+void visual_free_cache(struct composition_visual *visual)
+{
+    if (visual->cache.dc)
+    {
+        SelectObject(visual->cache.dc, visual->cache.old_bitmap);
+        DeleteObject(visual->cache.bitmap);
+        DeleteDC(visual->cache.dc);
+    }
+    memset(&visual->cache, 0, sizeof(visual->cache));
+}
+
 static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
 {
     struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
@@ -86,6 +99,7 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
             child->parent = NULL;
         }
         dcomp_unlock();
+        visual_free_cache(visual);
         free(visual);
     }
 
@@ -118,22 +132,42 @@ static HRESULT STDMETHODCALLTYPE visual_SetOffsetYAnimation(IDCompositionVisualU
 
 static HRESULT STDMETHODCALLTYPE visual_SetOffsetY(IDCompositionVisualUnknown *iface, float offset_y)
 {
-    FIXME("iface %p, offset_y %f stub!\n", iface, offset_y);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, offset_y %f.\n", iface, offset_y);
+
+    visual->offset_y = offset_y;
+    return S_OK;
 }
+
+static const D2D_MATRIX_3X2_F identity_matrix = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
 
 static HRESULT STDMETHODCALLTYPE visual_SetTransformObject(IDCompositionVisualUnknown *iface,
         IDCompositionTransform *transform)
 {
-    FIXME("iface %p, transform %p stub!\n", iface, transform);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, transform %p.\n", iface, transform);
+
+    /* A NULL transform object removes the transform. */
+    if (transform)
+        FIXME("Transform objects are not supported, ignoring %p.\n", transform);
+    visual->transform = identity_matrix;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetTransform(IDCompositionVisualUnknown *iface,
         const D2D_MATRIX_3X2_F *matrix)
 {
-    FIXME("iface %p, matrix %p stub!\n", iface, matrix);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, matrix {%f, %f, %f, %f, %f, %f}.\n", iface, matrix->_11, matrix->_12,
+            matrix->_21, matrix->_22, matrix->_31, matrix->_32);
+
+    if (matrix->_11 != 1.0f || matrix->_12 != 0.0f || matrix->_21 != 0.0f || matrix->_22 != 1.0f)
+        FIXME("Only translations are supported, the rest of the transform is ignored.\n");
+    visual->transform = *matrix;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetTransformParent(IDCompositionVisualUnknown *iface,
@@ -185,15 +219,27 @@ static HRESULT STDMETHODCALLTYPE visual_SetBorderMode(IDCompositionVisualUnknown
 static HRESULT STDMETHODCALLTYPE visual_SetClipObject(IDCompositionVisualUnknown *iface,
         IDCompositionClip *clip)
 {
-    FIXME("iface %p, clip %p stub!\n", iface, clip);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, clip %p.\n", iface, clip);
+
+    /* A NULL clip object removes the clip. */
+    if (clip)
+        FIXME("Clip objects are not supported, ignoring %p.\n", clip);
+    visual->has_clip = FALSE;
+    return S_OK;
 }
 
 /* C++ method: SetClip(THIS_ const D2D_RECT_F &rect).  Use pointer instead of reference */
 static HRESULT STDMETHODCALLTYPE visual_SetClip(IDCompositionVisualUnknown *iface, const D2D_RECT_F *rect)
 {
-    FIXME("iface %p, rect %p stub!\n", iface, rect);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, rect {%f, %f, %f, %f}.\n", iface, rect->left, rect->top, rect->right, rect->bottom);
+
+    visual->clip = *rect;
+    visual->has_clip = TRUE;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *iface, IUnknown *content)
@@ -305,6 +351,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         IUnknown_Release(visual->content);
         visual->content = NULL;
     }
+    visual->cache.content = NULL;
 
     if (content)
     {
@@ -411,15 +458,37 @@ static HRESULT STDMETHODCALLTYPE visual_RemoveAllVisuals(IDCompositionVisualUnkn
 static HRESULT STDMETHODCALLTYPE visual_SetCompositeMode(IDCompositionVisualUnknown *iface,
         enum DCOMPOSITION_COMPOSITE_MODE composite_mode)
 {
-    FIXME("iface %p, composite_mode %d stub!\n", iface, composite_mode);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, composite_mode %d.\n", iface, composite_mode);
+
+    if (composite_mode != DCOMPOSITION_COMPOSITE_MODE_SOURCE_OVER
+        && composite_mode != DCOMPOSITION_COMPOSITE_MODE_DESTINATION_INVERT
+        && composite_mode != DCOMPOSITION_COMPOSITE_MODE_MIN_BLEND
+        && composite_mode != DCOMPOSITION_COMPOSITE_MODE_INHERIT)
+        return E_INVALIDARG;
+
+    if (composite_mode == DCOMPOSITION_COMPOSITE_MODE_DESTINATION_INVERT
+        || composite_mode == DCOMPOSITION_COMPOSITE_MODE_MIN_BLEND)
+        FIXME("Composite mode %d is not supported, using source over.\n", composite_mode);
+    visual->composite_mode = composite_mode;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetOpacityMode(IDCompositionVisualUnknown *iface,
         enum DCOMPOSITION_OPACITY_MODE opacity_mode)
 {
-    FIXME("iface %p, opacity_mode %d stub!\n", iface, opacity_mode);
-    return E_NOTIMPL;
+    struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
+
+    TRACE("iface %p, opacity_mode %d.\n", iface, opacity_mode);
+
+    if (opacity_mode != DCOMPOSITION_OPACITY_MODE_LAYER
+        && opacity_mode != DCOMPOSITION_OPACITY_MODE_MULTIPLY
+        && opacity_mode != DCOMPOSITION_OPACITY_MODE_INHERIT)
+        return E_INVALIDARG;
+
+    visual->opacity_mode = opacity_mode;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE visual_SetBackFaceVisibility(IDCompositionVisualUnknown *iface,
@@ -1180,6 +1249,7 @@ HRESULT create_visual(int version, REFIID iid, void **new_visual)
     visual->version = version;
     visual->ref = 1;
     list_init(&visual->child_visuals);
+    visual->transform = identity_matrix;
     hr = IUnknown_QueryInterface(&visual->IDCompositionVisualUnknown_iface, iid, new_visual);
     IUnknown_Release(&visual->IDCompositionVisualUnknown_iface);
     return hr;
