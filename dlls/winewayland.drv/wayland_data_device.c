@@ -585,11 +585,23 @@ static void data_control_device_finished(
 {
 }
 
+/* Some compositors send primary_selection even to version 1 clients, and
+ * libwayland aborts on events without a listener. */
+static void data_control_device_primary_selection(
+    void *data,
+    struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1,
+    struct zwlr_data_control_offer_v1 *zwlr_data_control_offer_v1)
+{
+    if (zwlr_data_control_offer_v1)
+        wayland_data_offer_destroy(zwlr_data_control_offer_v1_get_user_data(zwlr_data_control_offer_v1));
+}
+
 static const struct zwlr_data_control_device_v1_listener data_control_device_listener =
 {
     data_control_device_data_offer,
     data_control_device_selection,
     data_control_device_finished,
+    data_control_device_primary_selection,
 };
 
 /**********************************************************************
