@@ -320,12 +320,330 @@ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_
     window_surface_release( driver_surface );
 }
 
+static const struct window_surface_funcs embed_surface_funcs;
+
 struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi )
 {
     if (!surface || surface == &dummy_surface) return surface;
+    if (surface->funcs == &embed_surface_funcs) return NULL;  /* drawn by another process, not the driver */
     if (surface->funcs != &scaled_surface_funcs) return surface;
     if (memcmp( &get_scaled_surface( surface )->dpi_to, &monitor_dpi, sizeof(monitor_dpi) )) return &dummy_surface;
     return get_scaled_surface( surface )->target_surface;
+}
+
+/*
+ * Embedded window surfaces
+ *
+ * A window whose parent belongs to another process is drawn into the top-level
+ * window of that other process. Display drivers that can't draw into windows
+ * of other processes (they have no GetDC entry point) give such a window a
+ * surface of its own, in a section shared with the top-level window's process,
+ * which copies the bits into its own surface when notified.
+ */
+
+struct embed_shm
+{
+    LONG pending;   /* a WM_WINE_EMBED_FLUSH notification is queued */
+    UINT width;
+    UINT height;
+    RECT dirty;     /* dirty area, in surface coordinates */
+};
+
+#define EMBED_BITS_OFFSET 0x10000  /* keeps the bits on an allocation granularity boundary */
+
+struct embed_surface
+{
+    struct window_surface header;
+    HWND                  top;      /* top-level window of the other process */
+    HANDLE                section;
+    HANDLE                remote;   /* the section handle in the top-level window's process */
+    struct embed_shm     *shm;
+};
+
+static struct embed_surface *get_embed_surface( struct window_surface *window_surface )
+{
+    return CONTAINING_RECORD( window_surface, struct embed_surface, header );
+}
+
+static void embed_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
+{
+}
+
+static BOOL embed_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                                 const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                 const BITMAPINFO *shape_info, const void *shape_bits )
+{
+    struct embed_surface *surface = get_embed_surface( window_surface );
+    struct embed_shm *shm = surface->shm;
+
+    if (IsRectEmpty( &shm->dirty )) shm->dirty = *dirty;
+    else union_rect( &shm->dirty, &shm->dirty, dirty );
+
+    if (!InterlockedExchange( &shm->pending, 1 ))
+        NtUserPostMessage( surface->top, WM_WINE_EMBED_FLUSH, (WPARAM)window_surface->hwnd,
+                           (LPARAM)surface->remote );
+    return TRUE;
+}
+
+static void embed_surface_destroy( struct window_surface *window_surface )
+{
+    struct embed_surface *surface = get_embed_surface( window_surface );
+
+    /* lets the other process release its handle */
+    if (surface->remote) NtUserPostMessage( surface->top, WM_WINE_EMBED_FLUSH, (WPARAM)window_surface->hwnd, 0 );
+    if (surface->shm) NtUnmapViewOfSection( GetCurrentProcess(), surface->shm );
+    if (surface->section) NtClose( surface->section );
+}
+
+static const struct window_surface_funcs embed_surface_funcs =
+{
+    .size = sizeof(struct embed_surface),
+    .set_clip = embed_surface_set_clip,
+    .flush = embed_surface_flush,
+    .destroy = embed_surface_destroy
+};
+
+/* duplicate a section handle into the process of a window */
+HANDLE share_section( HANDLE section, HWND hwnd )
+{
+    OBJECT_ATTRIBUTES attr;
+    CLIENT_ID cid = {0};
+    HANDLE process, remote = 0;
+    DWORD pid = 0;
+
+    NtUserGetWindowThread( hwnd, &pid );
+    cid.UniqueProcess = ULongToHandle( pid );
+    InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
+    if (NtOpenProcess( &process, PROCESS_DUP_HANDLE, &attr, &cid )) return 0;
+    if (NtDuplicateObject( GetCurrentProcess(), section, process, &remote, 0, 0, DUPLICATE_SAME_ACCESS ))
+        remote = 0;
+    NtClose( process );
+    return remote;
+}
+
+void create_embed_window_surface( HWND hwnd, HWND top, const RECT *surface_rect, struct window_surface **window_surface )
+{
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    struct embed_surface *surface;
+    struct window_surface *previous;
+    LARGE_INTEGER size;
+    SIZE_T view_size = sizeof(struct embed_shm);
+    HANDLE section = 0;
+    HBITMAP bitmap = 0;
+    void *shm = NULL;
+
+    TRACE( "hwnd %p, top %p, surface_rect %s\n", hwnd, top, wine_dbgstr_rect( surface_rect ) );
+
+    if ((previous = *window_surface) && previous->funcs == &embed_surface_funcs &&
+        get_embed_surface( previous )->top == top)
+        return;
+
+    memset( info, 0, sizeof(*info) );
+    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth       = surface_rect->right - surface_rect->left;
+    info->bmiHeader.biHeight      = -(surface_rect->bottom - surface_rect->top); /* top-down */
+    info->bmiHeader.biPlanes      = 1;
+    info->bmiHeader.biBitCount    = 32;
+    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
+    info->bmiHeader.biCompression = BI_RGB;
+
+    size.QuadPart = EMBED_BITS_OFFSET + info->bmiHeader.biSizeImage;
+    if (NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &size, PAGE_READWRITE, SEC_COMMIT, 0 )) goto failed;
+    if (NtMapViewOfSection( section, GetCurrentProcess(), &shm, 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READWRITE ))
+        goto failed;
+    if (!(bitmap = NtGdiCreateDIBSection( 0, section, EMBED_BITS_OFFSET, info, DIB_RGB_COLORS, 0, 0, 0, NULL )))
+        goto failed;
+    if (!(previous = window_surface_create( &embed_surface_funcs, hwnd, surface_rect, info, bitmap ))) goto failed;
+
+    surface = get_embed_surface( previous );
+    surface->top = top;
+    surface->section = section;
+    surface->shm = shm;
+    surface->shm->width = info->bmiHeader.biWidth;
+    surface->shm->height = -info->bmiHeader.biHeight;
+    surface->remote = share_section( section, top );
+    if (!surface->remote) WARN( "cannot share the surface of %p with the process of %p\n", hwnd, top );
+
+    if (*window_surface) window_surface_release( *window_surface );
+    *window_surface = previous;
+    return;
+
+failed:
+    WARN( "failed to create an embedded surface for %p\n", hwnd );
+    if (bitmap) NtGdiDeleteObjectApp( bitmap );
+    if (shm) NtUnmapViewOfSection( GetCurrentProcess(), shm );
+    if (section) NtClose( section );
+}
+
+/* the bits of windows of other processes embedded in our top-level windows */
+struct embedded_window
+{
+    struct list       entry;
+    HWND              hwnd;
+    HANDLE            section;
+    struct embed_shm *shm;
+    HDC               hdc;
+    HBITMAP           bitmap;
+};
+
+static struct list embedded_windows = LIST_INIT( embedded_windows );
+
+static void free_embedded_window( struct embedded_window *embedded )
+{
+    list_remove( &embedded->entry );
+    if (embedded->hdc) NtGdiDeleteObjectApp( embedded->hdc );
+    if (embedded->bitmap) NtGdiDeleteObjectApp( embedded->bitmap );
+    if (embedded->shm) NtUnmapViewOfSection( GetCurrentProcess(), embedded->shm );
+    NtClose( embedded->section );
+    free( embedded );
+}
+
+static struct embedded_window *open_embedded_window( HWND hwnd, HANDLE section )
+{
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    struct embedded_window *embedded;
+    SIZE_T view_size = sizeof(struct embed_shm);
+    void *shm = NULL;
+
+    if (!(embedded = calloc( 1, sizeof(*embedded) ))) return NULL;
+    embedded->hwnd = hwnd;
+    embedded->section = section;
+    list_add_tail( &embedded_windows, &embedded->entry );
+
+    if (NtMapViewOfSection( section, GetCurrentProcess(), &shm, 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READWRITE ))
+        goto failed;
+    embedded->shm = shm;
+
+    memset( info, 0, sizeof(*info) );
+    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth       = embedded->shm->width;
+    info->bmiHeader.biHeight      = -(int)embedded->shm->height;
+    info->bmiHeader.biPlanes      = 1;
+    info->bmiHeader.biBitCount    = 32;
+    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
+    info->bmiHeader.biCompression = BI_RGB;
+
+    if (!(embedded->bitmap = NtGdiCreateDIBSection( 0, section, EMBED_BITS_OFFSET, info, DIB_RGB_COLORS,
+                                                    0, 0, 0, NULL )))
+        goto failed;
+    if (!(embedded->hdc = NtGdiCreateCompatibleDC( 0 ))) goto failed;
+    NtGdiSelectBitmap( embedded->hdc, embedded->bitmap );
+    return embedded;
+
+failed:
+    WARN( "cannot open the surface of embedded window %p\n", hwnd );
+    free_embedded_window( embedded );
+    return NULL;
+}
+
+/* the visible region of an embedded window, in screen coordinates */
+static HRGN get_embedded_window_region( HWND hwnd, RECT *win_rect )
+{
+    size_t size = 256;
+    NTSTATUS status;
+    HRGN rgn = 0;
+
+    do
+    {
+        RGNDATA *data = malloc( sizeof(*data) + size - 1 );
+        if (!data) return 0;
+
+        SERVER_START_REQ( get_visible_region )
+        {
+            req->window = wine_server_user_handle( hwnd );
+            req->flags  = DCX_WINDOW | DCX_CLIPSIBLINGS;
+            wine_server_set_reply( req, data->Buffer, size );
+            if (!(status = wine_server_call( req )))
+            {
+                size_t reply_size = wine_server_reply_size( reply );
+                data->rdh.dwSize   = sizeof(data->rdh);
+                data->rdh.iType    = RDH_RECTANGLES;
+                data->rdh.nCount   = reply_size / sizeof(RECT);
+                data->rdh.nRgnSize = reply_size;
+                rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
+                *win_rect = wine_server_get_rect( reply->win_rect );
+            }
+            else size = reply->total_size;
+        }
+        SERVER_END_REQ;
+        free( data );
+    } while (status == STATUS_BUFFER_OVERFLOW);
+
+    return rgn;
+}
+
+/* child windows of yet another process draw over the embedded window's bits */
+static void exclude_other_process_children( HRGN rgn, HWND hwnd, DWORD pid )
+{
+    HWND *list;
+    DWORD child_pid;
+    RECT rect;
+    UINT i;
+
+    if (!(list = list_window_children( hwnd ))) return;
+    for (i = 0; list[i]; i++)
+    {
+        if (!(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
+        NtUserGetWindowThread( list[i], &child_pid );
+        if (child_pid == pid)
+        {
+            exclude_other_process_children( rgn, list[i], pid );
+            continue;
+        }
+        if (get_window_rect( list[i], &rect, get_thread_dpi() ))
+        {
+            HRGN child = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom );
+            NtGdiCombineRgn( rgn, rgn, child, RGN_DIFF );
+            NtGdiDeleteObjectApp( child );
+        }
+    }
+    free( list );
+}
+
+/* WM_WINE_EMBED_FLUSH: copy the bits of an embedded window into our top-level window */
+void present_embedded_window( HWND top, HWND hwnd, HANDLE section )
+{
+    struct embedded_window *embedded = NULL, *iter;
+    RECT dirty, win_rect, top_rect;
+    DWORD pid = 0;
+    HRGN rgn;
+    HDC hdc;
+
+    LIST_FOR_EACH_ENTRY( iter, &embedded_windows, struct embedded_window, entry )
+        if (iter->hwnd == hwnd) { embedded = iter; break; }
+
+    if (embedded && embedded->section != section)
+    {
+        free_embedded_window( embedded );
+        embedded = NULL;
+    }
+    if (!section) return;
+    if (!embedded && !(embedded = open_embedded_window( hwnd, section ))) return;
+
+    dirty = embedded->shm->dirty;
+    SetRectEmpty( &embedded->shm->dirty );
+    InterlockedExchange( &embedded->shm->pending, 0 );
+
+    TRACE( "top %p, hwnd %p, dirty %s\n", top, hwnd, wine_dbgstr_rect( &dirty ) );
+    if (IsRectEmpty( &dirty )) return;
+
+    if (!(rgn = get_embedded_window_region( hwnd, &win_rect ))) return;
+    NtUserGetWindowThread( hwnd, &pid );
+    exclude_other_process_children( rgn, hwnd, pid );
+
+    if (get_window_rect( top, &top_rect, get_thread_dpi() ) &&
+        (hdc = NtUserGetDCEx( top, 0, DCX_WINDOW | DCX_CACHE )))
+    {
+        NtGdiOffsetRgn( rgn, -top_rect.left, -top_rect.top );
+        NtGdiExtSelectClipRgn( hdc, rgn, RGN_AND );
+        NtGdiBitBlt( hdc, win_rect.left - top_rect.left + dirty.left, win_rect.top - top_rect.top + dirty.top,
+                     dirty.right - dirty.left, dirty.bottom - dirty.top,
+                     embedded->hdc, dirty.left, dirty.top, SRCCOPY, 0, 0 );
+        NtUserReleaseDC( top, hdc );
+    }
+    NtGdiDeleteObjectApp( rgn );
 }
 
 /* window surface common helpers */

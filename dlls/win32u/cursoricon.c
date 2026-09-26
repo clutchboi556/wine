@@ -74,9 +74,225 @@ static struct cursoricon_object *get_icon_ptr( HICON handle )
     return obj;
 }
 
+/*
+ * Cursors of embedded windows
+ *
+ * When the display driver can't draw into windows of other processes (see
+ * create_embed_window_surface), it can't set their cursor either: the cursor of
+ * a window embedded in another process's top-level window is recreated in that
+ * process from a copy of its image.
+ */
+
+struct cursor_shm
+{
+    BOOL      is_icon;
+    UINT      width;
+    UINT      color_height;  /* 0 without a color bitmap */
+    UINT      mask_height;
+    POINT     hotspot;
+    UINT      module_len;    /* in bytes */
+    WCHAR     module[MAX_PATH];
+    UINT      res_len;       /* in bytes, 0 for an integer resource */
+    ULONG_PTR res_id;
+    WCHAR     res_name[64];
+    DWORD     bits[1];       /* 32-bpp color rows, then 32-bpp mask rows, top-down */
+};
+
+static BOOL get_bitmap_bits32( HBITMAP bitmap, UINT width, UINT height, DWORD *bits )
+{
+    BITMAPINFO info = {{ .biSize = sizeof(BITMAPINFOHEADER), .biWidth = width, .biHeight = -(int)height,
+                         .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB }};
+    HDC hdc = NtGdiCreateCompatibleDC( 0 );
+    BOOL ret = NtGdiGetDIBitsInternal( hdc, bitmap, 0, height, bits, &info, DIB_RGB_COLORS, 0, 0 ) == height;
+    NtGdiDeleteObjectApp( hdc );
+    return ret;
+}
+
+static HANDLE share_cursor( HCURSOR handle, HWND top )
+{
+    WCHAR module_buf[MAX_PATH], res_buf[64];
+    UNICODE_STRING module = { 0, sizeof(module_buf), module_buf }, res_name = { 0, sizeof(res_buf), res_buf };
+    struct cursor_shm *shm = NULL;
+    HANDLE section = 0, remote = 0;
+    BITMAP color = {0}, mask;
+    LARGE_INTEGER size;
+    SIZE_T view_size = 0;
+    ICONINFO info;
+
+    if (!NtUserGetIconInfo( handle, &info, &module, &res_name, NULL, 0 )) return 0;
+    if (!NtGdiExtGetObjectW( info.hbmMask, sizeof(mask), &mask )) goto done;
+    if (info.hbmColor && !NtGdiExtGetObjectW( info.hbmColor, sizeof(color), &color )) goto done;
+    if (info.hbmColor && color.bmWidth != mask.bmWidth) goto done;
+
+    size.QuadPart = offsetof( struct cursor_shm, bits[mask.bmWidth * (color.bmHeight + mask.bmHeight)] );
+    if (NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &size, PAGE_READWRITE, SEC_COMMIT, 0 )) goto done;
+    if (NtMapViewOfSection( section, GetCurrentProcess(), (void **)&shm, 0, 0, NULL, &view_size, ViewShare,
+                            0, PAGE_READWRITE ))
+        goto done;
+
+    shm->is_icon = info.fIcon;
+    shm->width = mask.bmWidth;
+    shm->color_height = info.hbmColor ? color.bmHeight : 0;
+    shm->mask_height = mask.bmHeight;
+    shm->hotspot.x = info.xHotspot;
+    shm->hotspot.y = info.yHotspot;
+    /* NtUserGetIconInfo returns lengths in characters */
+    shm->module_len = min( module.Length * sizeof(WCHAR), sizeof(shm->module) );
+    memcpy( shm->module, module.Buffer, shm->module_len );
+    if (res_name.Buffer && res_name.Length)
+    {
+        shm->res_len = min( res_name.Length * sizeof(WCHAR), sizeof(shm->res_name) );
+        memcpy( shm->res_name, res_name.Buffer, shm->res_len );
+    }
+    else shm->res_id = (ULONG_PTR)res_name.Buffer;
+
+    if (info.hbmColor && !get_bitmap_bits32( info.hbmColor, shm->width, shm->color_height, shm->bits )) goto done;
+    if (!get_bitmap_bits32( info.hbmMask, shm->width, shm->mask_height,
+                            shm->bits + shm->width * shm->color_height ))
+        goto done;
+    remote = share_section( section, top );
+
+done:
+    if (shm) NtUnmapViewOfSection( GetCurrentProcess(), shm );
+    if (section) NtClose( section );
+    NtGdiDeleteObjectApp( info.hbmMask );
+    if (info.hbmColor) NtGdiDeleteObjectApp( info.hbmColor );
+    return remote;
+}
+
+static HBITMAP create_bitmap32( UINT width, UINT height, const DWORD *bits, BOOL premultiply )
+{
+    BITMAPINFO info = {{ .biSize = sizeof(BITMAPINFOHEADER), .biWidth = width, .biHeight = -(int)height,
+                         .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB }};
+    HBITMAP bitmap;
+    DWORD *dst;
+    UINT i;
+
+    if (!(bitmap = NtGdiCreateDIBSection( 0, NULL, 0, &info, DIB_RGB_COLORS, 0, 0, 0, (void **)&dst ))) return 0;
+    for (i = 0; i < width * height; i++)
+    {
+        DWORD pixel = bits[i], alpha = pixel >> 24;
+        if (premultiply)
+            pixel = (alpha << 24) | (((pixel >> 16) & 0xff) * alpha / 255) << 16 |
+                    (((pixel >> 8) & 0xff) * alpha / 255) << 8 | ((pixel & 0xff) * alpha / 255);
+        dst[i] = pixel;
+    }
+    return bitmap;
+}
+
+static HBITMAP create_mask_bitmap( UINT width, UINT height, const DWORD *bits )
+{
+    UINT stride = (width + 15) / 16 * 2, x, y;
+    HBITMAP bitmap = 0;
+    BYTE *mask;
+
+    if (!(mask = calloc( height, stride ))) return 0;
+    for (y = 0; y < height; y++)
+        for (x = 0; x < width; x++)
+            if (bits[y * width + x] & 0xffffff) mask[y * stride + x / 8] |= 0x80 >> (x % 8);
+    bitmap = NtGdiCreateBitmap( width, height, 1, 1, mask );
+    free( mask );
+    return bitmap;
+}
+
+static HCURSOR create_shared_cursor( HANDLE section )
+{
+    struct cursoricon_frame frame = {0};
+    struct cursoricon_desc desc = { .frames = &frame };
+    UNICODE_STRING module, res_name;
+    struct cursor_shm *shm = NULL;
+    SIZE_T view_size = 0;
+    HCURSOR handle = 0;
+    BOOL has_alpha = FALSE;
+    UINT i;
+
+    if (NtMapViewOfSection( section, GetCurrentProcess(), (void **)&shm, 0, 0, NULL, &view_size, ViewShare,
+                            0, PAGE_READONLY ))
+        return 0;
+
+    frame.width = shm->width;
+    frame.height = shm->color_height ? shm->color_height : shm->mask_height / 2;
+    frame.hotspot = shm->hotspot;
+    frame.mask = create_mask_bitmap( shm->width, shm->mask_height, shm->bits + shm->width * shm->color_height );
+    if (shm->color_height)
+    {
+        frame.color = create_bitmap32( shm->width, shm->color_height, shm->bits, FALSE );
+        for (i = 0; i < shm->width * shm->color_height; i++) if ((has_alpha = !!(shm->bits[i] >> 24))) break;
+        if (has_alpha) frame.alpha = create_bitmap32( shm->width, shm->color_height, shm->bits, TRUE );
+    }
+
+    module.Buffer = shm->module;
+    module.Length = module.MaximumLength = shm->module_len;
+    if (shm->res_len)
+    {
+        res_name.Buffer = shm->res_name;
+        res_name.Length = res_name.MaximumLength = shm->res_len;
+    }
+    else
+    {
+        res_name.Buffer = (WCHAR *)shm->res_id;
+        res_name.Length = res_name.MaximumLength = 0;
+    }
+
+    if (frame.mask && (handle = NtUserCreateCursorIcon( shm->is_icon )) &&
+        !NtUserSetCursorIconData( handle, &module, &res_name, &desc ))
+    {
+        NtUserDestroyCursor( handle, 0 );
+        handle = 0;
+    }
+    if (!handle)
+    {
+        if (frame.mask) NtGdiDeleteObjectApp( frame.mask );
+        if (frame.color) NtGdiDeleteObjectApp( frame.color );
+        if (frame.alpha) NtGdiDeleteObjectApp( frame.alpha );
+    }
+    NtUnmapViewOfSection( GetCurrentProcess(), shm );
+    return handle;
+}
+
+/* WM_WINE_EMBED_SETCURSOR: the cursor of a window of another process embedded in our top-level window */
+void set_embedded_window_cursor( HWND top, HCURSOR remote, HANDLE section )
+{
+    static struct { HCURSOR remote, local; } cache[32];
+    static UINT next;
+    HCURSOR local = 0;
+    UINT i;
+
+    TRACE( "top %p, cursor %p, section %p\n", top, remote, section );
+
+    if (remote)
+    {
+        for (i = 0; i < ARRAY_SIZE(cache); i++) if (cache[i].remote == remote) break;
+        if (i < ARRAY_SIZE(cache)) local = cache[i].local;
+        /* the embedded window can't copy a cursor it doesn't own, but then it may be ours */
+        else if (!section) local = remote;
+        else if ((local = create_shared_cursor( section )))
+        {
+            i = next++ % ARRAY_SIZE(cache);
+            if (cache[i].local) NtUserDestroyCursor( cache[i].local, 0 );
+            cache[i].remote = remote;
+            cache[i].local = local;
+        }
+    }
+    if (section) NtClose( section );
+    user_driver->pSetCursor( top, local );
+}
+
+static BOOL set_embedding_window_cursor( HWND window, HCURSOR handle )
+{
+    HWND top;
+
+    if (!window || !(top = NtUserGetAncestor( window, GA_ROOT ))) return FALSE;
+    if (is_current_process_window( top ) || display_driver_draws_other_processes()) return FALSE;
+
+    NtUserPostMessage( top, WM_WINE_EMBED_SETCURSOR, (WPARAM)handle, (LPARAM)(handle ? share_cursor( handle, top ) : 0) );
+    return TRUE;
+}
+
 BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
 {
     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
+    if (set_embedding_window_cursor( window, handle )) return TRUE;
     user_driver->pSetCursor( window, handle );
     return TRUE;
 }
