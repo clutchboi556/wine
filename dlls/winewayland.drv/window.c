@@ -185,8 +185,10 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
 
+    /* A managed window gets its own toplevel, and its owner (if any) becomes
+     * the toplevel's parent; an unmanaged one is drawn as part of its owner. */
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
-    else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    else if (owner_surface && !data->managed) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
 
     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
@@ -220,6 +222,11 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         wayland_surface_make_toplevel(surface);
+        /* Lets the compositor keep dialogs above, and float them over, their owner. */
+        if (surface->xdg_toplevel)
+            xdg_toplevel_set_parent(surface->xdg_toplevel,
+                                    owner_surface && wayland_surface_is_toplevel(owner_surface) ?
+                                    owner_surface->xdg_toplevel : NULL);
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, owner_surface);
@@ -434,7 +441,8 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
-    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT);
+    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT), win_owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
+    DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct wayland_surface *owner_surface;
     struct wayland_win_data *data, *owner_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
@@ -444,7 +452,18 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* Get the managed state with win_data unlocked, as is_window_managed
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
-    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+    managed = is_window_managed(hwnd, swp_flags, fullscreen);
+    if (win_owner) win_owner = NtUserGetAncestor(win_owner, GA_ROOT);
+    /* Owned windows without a caption (tool windows, palettes, notification
+     * bubbles) belong to their owner's surface even when they are activated:
+     * as separate toplevels they could be neither positioned nor kept over it. */
+    if (managed && win_owner && !fullscreen && (style & WS_CAPTION) != WS_CAPTION &&
+        !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
+        managed = FALSE;
+    if (!managed && surface) owner = owner_hint ? owner_hint : win_owner;
+    else if (managed && win_owner) owner = win_owner;
+
+    TRACE("hwnd %p style %#x owner %p managed %d surface owner %p\n", hwnd, (UINT)style, win_owner, managed, owner);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
