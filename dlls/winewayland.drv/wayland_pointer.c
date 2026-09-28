@@ -1036,7 +1036,9 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     pthread_mutex_lock(&pointer->mutex);
     if (wl_surface && pointer->pending_warp)
     {
-        if (process_wayland.wp_pointer_warp_v1)
+        /* wp_pointer_warp_v1.warp_pointer needs a wl_pointer; a seat without
+         * one (a headless compositor) would make libwayland abort the process. */
+        if (process_wayland.wp_pointer_warp_v1 && pointer->wl_pointer)
         {
             wp_pointer_warp_v1_warp_pointer(
                     process_wayland.wp_pointer_warp_v1,
