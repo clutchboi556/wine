@@ -2139,8 +2139,15 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
 
         /* send palette messages */
         if (send_message( hwnd, WM_QUERYNEWPALETTE, 0, 0 ))
-            send_message_timeout( HWND_BROADCAST, WM_PALETTEISCHANGING, (WPARAM)hwnd, 0,
-                                  SMTO_ABORTIFHUNG, 2000, FALSE );
+        {
+            /* Notify, don't wait: this goes to every top-level window of the
+             * session, and a synchronous send with a timeout stalls the
+             * activating thread for the full timeout on each window whose
+             * thread is not pumping messages (AutoCAD froze for 30+ s per
+             * click on the WebView2 GPU thread's hidden DXGI windows). */
+            NtUserMessageCall( HWND_BROADCAST, WM_PALETTEISCHANGING, (WPARAM)hwnd, 0,
+                               0, NtUserSendNotifyMessage, FALSE );
+        }
         if (!is_window(hwnd))
         {
             ret = FALSE;
