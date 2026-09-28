@@ -13599,6 +13599,58 @@ static void test_SendMessageTimeout(void)
     CloseHandle( info.ready );
 }
 
+struct hung_thread_info
+{
+    HWND   hwnd;
+    HANDLE ready;
+    HANDLE stop;
+};
+
+/* creates a window and then never looks at its message queue again */
+static DWORD CALLBACK hung_thread_proc( void *arg )
+{
+    struct hung_thread_info *info = arg;
+
+    info->hwnd = CreateWindowA( "TestWindowClass", NULL, WS_OVERLAPPEDWINDOW,
+                                100, 100, 200, 200, 0, 0, 0, NULL );
+    SetEvent( info->ready );
+    WaitForSingleObject( info->stop, INFINITE );
+    return 0;
+}
+
+static void test_SendMessageTimeout_hung(void)
+{
+    struct hung_thread_info info;
+    HANDLE thread;
+    DWORD tid, start, elapsed;
+    DWORD_PTR res;
+    LRESULT ret;
+
+    info.ready = CreateEventA( NULL, 0, 0, NULL );
+    info.stop  = CreateEventA( NULL, 0, 0, NULL );
+    thread = CreateThread( NULL, 0, hung_thread_proc, &info, 0, &tid );
+    WaitForSingleObject( info.ready, INFINITE );
+
+    /* a thread that is not waiting for input and has not checked its queue
+     * for 5 seconds is hung, even if it never pumped messages at all */
+    Sleep( 5500 );
+    ok( IsHungAppWindow( info.hwnd ), "window of a thread that never pumps should be hung\n" );
+
+    start = GetTickCount();
+    SetLastError( 0xdeadbeef );
+    ret = SendMessageTimeoutA( info.hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2000, &res );
+    elapsed = GetTickCount() - start;
+    ok( !ret, "SendMessageTimeout succeeded\n" );
+    ok( GetLastError() == ERROR_TIMEOUT, "got error %lu\n", GetLastError() );
+    ok( elapsed < 1000, "SMTO_ABORTIFHUNG waited %lu ms on a hung thread\n", elapsed );
+
+    SetEvent( info.stop );
+    WaitForSingleObject( thread, INFINITE );
+    CloseHandle( thread );
+    CloseHandle( info.ready );
+    CloseHandle( info.stop );
+}
+
 
 /****************** edit message test *************************/
 #define ID_EDIT 0x1234
@@ -21675,6 +21727,7 @@ START_TEST(msg)
     test_DestroyWindow();
     test_DispatchMessage();
     test_SendMessageTimeout();
+    test_SendMessageTimeout_hung();
     test_edit_messages();
     test_quit_message();
     test_notify_message();
