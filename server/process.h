@@ -55,6 +55,7 @@ struct process
     int                  exit_code;       /* process exit code */
     int                  running_threads; /* number of threads running in this process */
     int                  user_threads;    /* number of user threads running in this process */
+    lparam_t             next_timer_id;   /* id for the next thread timer (process wide) */
     timeout_t            start_time;      /* absolute time at process start */
     timeout_t            end_time;        /* absolute time at process end */
     affinity_t           affinity;        /* process affinity mask */

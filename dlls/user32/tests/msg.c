@@ -12009,6 +12009,18 @@ static void CALLBACK callback_exception(HWND hwnd, UINT uMsg, UINT_PTR idEvent, 
     RaiseException(exception, 0, 0, NULL);
 }
 
+static BOOL thread_timer_kill_result;
+
+static DWORD WINAPI thread_timer_kill_proc(LPVOID x)
+{
+    struct timer_info *info = x;
+
+    /* Windows keeps thread-timer ids in the process wide user handle table, so
+     * this must succeed even though the timer was created by another thread. */
+    thread_timer_kill_result = KillTimer(NULL, info->id);
+    return 0;
+}
+
 static DWORD WINAPI timer_thread_proc(LPVOID x)
 {
     struct timer_info *info = x;
@@ -12092,6 +12104,7 @@ static void test_timers(void)
 static void test_timers_no_wnd(void)
 {
     static UINT_PTR ids[0xffff];
+    struct timer_info info;
     UINT_PTR id, id2;
     DWORD start;
     MSG msg;
@@ -12154,6 +12167,22 @@ static void test_timers_no_wnd(void)
     ok(GetLastError()==ERROR_NO_MORE_USER_HANDLES || broken(GetLastError()==0xdeadbeef),
             "GetLastError() = %ld\n", GetLastError());
     while (i > 0) KillTimer(NULL, ids[--i]);
+
+    /* A thread timer is process wide: a thread can kill one created by another
+     * thread, and the timer really stops. */
+    count = 0;
+    info.hWnd = NULL;
+    info.id = SetTimer(NULL, 0, 100, callback_count);
+    ok(info.id != 0, "did not get id from SetTimer.\n");
+    thread_timer_kill_result = FALSE;
+    info.handles[1] = CreateThread(NULL, 0, thread_timer_kill_proc, &info, 0, NULL);
+    ok(info.handles[1] != NULL, "CreateThread failed\n");
+    WaitForSingleObject(info.handles[1], 5000);
+    CloseHandle(info.handles[1]);
+    ok(thread_timer_kill_result, "KillTimer(NULL, %lu) from another thread failed\n", (unsigned long)info.id);
+    Sleep(250);
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+    ok(count == 0, "thread timer killed from another thread fired %i time(s)\n", count);
 }
 
 static void test_timers_exception(DWORD code)
