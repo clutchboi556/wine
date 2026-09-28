@@ -1280,8 +1280,19 @@ static void cleanup_results( struct msg_queue *queue )
 /* check if the thread owning the queue is hung (not checking for messages) */
 static int is_queue_hung( struct msg_queue *queue )
 {
-    /* queue is hung if it's signaled and thread didn't access it for more than 5 seconds */
-    return get_queue_status( queue ) && monotonic_time - queue->shared->access_time > 5 * TICKS_PER_SEC;
+    const queue_shm_t *queue_shm = queue->shared;
+
+    if (monotonic_time - queue_shm->access_time <= 5 * TICKS_PER_SEC) return 0;
+
+    /* A thread that has never waited on its queue (a worker thread that only
+     * created a few helper windows) is not waiting for input: like Windows,
+     * consider it hung once it has been silent for 5 seconds, so that
+     * SMTO_ABORTIFHUNG sends and broadcasts skip it instead of burning their
+     * full timeout on every one of its windows. */
+    if (!queue_shm->wake_mask && !queue_shm->changed_mask) return 1;
+
+    /* otherwise the queue is hung if it's signaled and the thread didn't access it */
+    return get_queue_status( queue ) != 0;
 }
 
 static struct object *msg_queue_get_sync( struct object *obj )
