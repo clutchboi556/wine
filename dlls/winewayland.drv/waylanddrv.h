@@ -302,6 +302,9 @@ struct wayland_surface
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
+    /* the compositor reports the surface as maximized although the window
+     * never asked for it (Hyprland does that for tiled, even floating, windows) */
+    BOOL compositor_maximized;
     struct wayland_window_config window;
     int content_width, content_height;
     HCURSOR hcursor;
