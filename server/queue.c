@@ -1529,6 +1529,29 @@ static struct timer *find_timer( struct msg_queue *queue, user_handle_t win,
     return NULL;
 }
 
+/* find a thread timer (window == 0) anywhere in a process.  Windows allocates
+ * thread timer ids from the process wide user handle table, so a timer created
+ * by one thread is visible to - and cancellable from - every other thread of
+ * the same process. */
+static struct timer *find_thread_timer( struct process *process, unsigned int msg,
+                                        lparam_t id, struct msg_queue **owner )
+{
+    struct thread *thread;
+
+    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+    {
+        struct timer *timer;
+
+        if (!thread->queue) continue;
+        if ((timer = find_timer( thread->queue, 0, msg, id )))
+        {
+            if (owner) *owner = thread->queue;
+            return timer;
+        }
+    }
+    return NULL;
+}
+
 /* callback for the next timer expiration */
 static void timer_callback( void *private )
 {
@@ -3525,28 +3548,38 @@ DECL_HANDLER(set_win_timer)
     }
     else
     {
-        queue = get_current_queue();
-        /* look for a timer with this id */
-        if (id && (timer = find_timer( queue, 0, req->msg, id )))
+        struct msg_queue *owner = NULL;
+
+        /* an explicit id may name a timer owned by another thread of this
+         * process (see find_thread_timer); retime it where it lives */
+        if (id && (timer = find_thread_timer( current->process, req->msg, id, &owner )))
         {
             /* free and reuse id */
-            free_timer( queue, timer );
+            free_timer( owner, timer );
+            queue = owner;
         }
         else
         {
-            lparam_t end_id = queue->next_timer_id;
-
-            /* find a free id for it */
-            while (1)
+            queue = get_current_queue();
+            if (!id)
             {
-                id = queue->next_timer_id;
-                if (--queue->next_timer_id <= 0x100) queue->next_timer_id = 0x7fff;
+                lparam_t end_id;
 
-                if (!find_timer( queue, 0, req->msg, id )) break;
-                if (queue->next_timer_id == end_id)
+                /* thread timer ids are process wide, like Windows' user handles */
+                end_id = current->process->next_timer_id;
+
+                /* find a free id for it */
+                while (1)
                 {
-                    set_win32_error( ERROR_NO_MORE_USER_HANDLES );
-                    return;
+                    id = current->process->next_timer_id;
+                    if (--current->process->next_timer_id <= 0x100) current->process->next_timer_id = 0x7fff;
+
+                    if (!find_thread_timer( current->process, req->msg, id, NULL )) break;
+                    if (current->process->next_timer_id == end_id)
+                    {
+                        set_win32_error( ERROR_NO_MORE_USER_HANDLES );
+                        return;
+                    }
                 }
             }
         }
@@ -3584,7 +3617,17 @@ DECL_HANDLER(kill_win_timer)
             return;
         }
     }
-    else thread = (struct thread *)grab_object( current );
+    else
+    {
+        struct msg_queue *owner;
+
+        /* a thread timer may live in any thread's queue of this process */
+        if ((timer = find_thread_timer( current->process, req->msg, req->id, &owner )))
+            free_timer( owner, timer );
+        else
+            set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
 
     if (thread->queue && (timer = find_timer( thread->queue, win, req->msg, req->id )))
         free_timer( thread->queue, timer );
