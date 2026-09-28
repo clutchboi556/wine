@@ -439,8 +439,14 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         copy_from_window_region = shm_buffer->damage_region;
     }
 
+    /* Only a window that uses per-pixel alpha (UpdateLayeredWindow with
+     * ULW_ALPHA, i.e. window_surface->alpha_mask) carries meaningful alpha in
+     * its pixels. A layered window with a constant alpha or a color key draws
+     * with GDI, whose alpha channel is whatever was left there (usually 0):
+     * treat those pixels as opaque, like winex11 does; the constant alpha is
+     * applied through wp_alpha_modifier and the color key through the shape. */
     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
-                                 shape_bits && !wws->layered);
+                                 !(wws->layered && window_surface->alpha_mask));
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
