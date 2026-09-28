@@ -265,7 +265,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
           * Wayland compositors misbehave if the order is reversed. */
         if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-            !surface->window.minimized)
+            !surface->window.minimized && !surface->compositor_maximized)
         {
             xdg_toplevel_unset_maximized(surface->xdg_toplevel);
         }
@@ -600,6 +600,21 @@ static void wayland_configure_window(HWND hwnd)
     rect = map_rect_from_surface(surface, rect);
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
 
+    /* Some compositors (Hyprland) report every tiled, and even floating,
+     * window as maximized. Turning that into WS_MAXIMIZE makes the app lay
+     * itself out for the monitor's work area and get cropped to the tile, and
+     * leaves dialogs in a state they never asked for. Only adopt the size, as
+     * for a tiled state, and remember that the maximized state is the
+     * compositor's so we don't keep asking it to unmaximize. */
+    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+    {
+        if ((state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(style & WS_MAXIMIZE))
+            surface->compositor_maximized = TRUE;
+        else
+            surface->compositor_maximized = FALSE;
+    }
+
     wayland_win_data_release(data);
 
     TRACE("processing=%dx%d,%#x\n", width, height, state);
@@ -610,10 +625,10 @@ static void wayland_configure_window(HWND hwnd)
     flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
     if (rect.left == rect.right || rect.bottom == rect.top) flags |= SWP_NOSIZE;
 
-    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE)
+    /* The compositor restored a window that the app had maximized. */
+    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && (style & WS_MAXIMIZE)
         && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
-        NtUserSetWindowLong(hwnd, GWL_STYLE, style ^ WS_MAXIMIZE, FALSE);
+        NtUserSetWindowLong(hwnd, GWL_STYLE, style & ~WS_MAXIMIZE, FALSE);
 
     /* The Wayland maximized and fullscreen states are very strict about
      * surface size, so don't let the application override it. The tiled state
