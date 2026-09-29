@@ -303,11 +303,8 @@ struct wayland_surface
     };
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
     /* For a toplevel: the wl_surface of the client (GL/Vulkan) subsurface last
-     * attached under it, which owned popups must be stacked above, and the
-     * last popup placed on top, above which the next popup goes. Popups are
-     * validated through their HWND before use. */
+     * attached under it; owned popups are stacked above it. */
     struct wl_surface *client_ref;
-    HWND top_popup;
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
@@ -476,6 +473,7 @@ void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
 void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
+void wayland_restack_popups(HWND owner);
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);

@@ -778,36 +778,17 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
 
         wl_subsurface_set_position(surface->wl_subsurface, rect.left, rect.top);
 
-        /* Stack a new popup on top of its siblings: above the last popup we
-         * placed, else above the owner's client (GL/Vulkan) subsurface, else
-         * directly above the owner. place_above(owner) alone would put it
-         * *below* every existing sibling, including the client surface of
-         * the drawing area, which then shows through it (AutoCAD's context
-         * menus came out as ghosts under its DX12 view). */
+        /* A new subsurface starts on top of its siblings, but place_above(owner)
+         * - the only thing we did here - would move it *below* every existing
+         * sibling, including the GL/Vulkan client subsurface of the drawing
+         * area, which then showed through it (AutoCAD's context menus and
+         * command line came out as ghosts under its DX12 view). Stack all of
+         * the owner's popups in their Win32 z-order above the client surface
+         * instead, once, when the popup is created. */
         if (!surface->placed)
         {
-            struct wl_surface *ref = NULL;
-            struct wayland_win_data *top_data;
-
-            if (owner_surface->top_popup && owner_surface->top_popup != surface->hwnd &&
-                (top_data = wayland_win_data_get(owner_surface->top_popup)))
-            {
-                struct wayland_surface *top = top_data->wayland_surface;
-                if (top && top->role == WAYLAND_SURFACE_ROLE_SUBSURFACE && top->wl_subsurface &&
-                    top->owner_hwnd == owner_surface->hwnd)
-                    ref = top->wl_surface;
-                wayland_win_data_release(top_data);
-            }
-            if (!ref && owner_data->client_surface && owner_data->client_surface->wl_subsurface)
-                ref = owner_data->client_surface->wl_surface;
-            if (!ref) ref = owner_surface->client_ref;
-            if (!ref) ref = owner_surface->wl_surface;
-
-            TRACE("hwnd=%p placed above %p (%s)\n", surface->hwnd, ref,
-                  ref == owner_surface->wl_surface ? "owner" : "sibling");
-            wl_subsurface_place_above(surface->wl_subsurface, ref);
-            owner_surface->top_popup = surface->hwnd;
             surface->placed = TRUE;
+            wayland_restack_popups(owner_surface->hwnd);
         }
         wl_surface_commit(owner_surface->wl_surface);
 
@@ -1354,9 +1335,13 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 
         client->toplevel = toplevel;
         surface->client_ref = client->wl_surface;
+        TRACE("client %p attached under toplevel hwnd=%p surface=%p, client_ref=%p\n",
+              client, toplevel, surface, surface->client_ref);
+        wayland_surface_reconfigure_client(surface, client, rect);
+        /* the new subsurface came in on top of the popups; restore their order */
+        wayland_restack_popups(toplevel);
     }
-
-    wayland_surface_reconfigure_client(surface, client, rect);
+    else wayland_surface_reconfigure_client(surface, client, rect);
     /* Commit to apply subsurface positioning. */
     wl_surface_commit(surface->wl_surface);
 

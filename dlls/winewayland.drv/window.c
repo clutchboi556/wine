@@ -645,6 +645,54 @@ static void wayland_configure_window(HWND hwnd)
 }
 
 /**********************************************************************
+ *           wayland_restack_popups
+ *
+ * Stack every popup subsurface owned by a toplevel in Win32 z-order, above
+ * the toplevel's client (GL/Vulkan) subsurface if it has one, else directly
+ * above the toplevel. Wayland keeps a new subsurface on top of its siblings
+ * only until it is placed, and placing it "above the parent" puts it under
+ * all of them, so the order has to be rebuilt from Win32's.
+ */
+void wayland_restack_popups(HWND owner)
+{
+    struct wayland_win_data *owner_data, *data;
+    struct wayland_surface *owner_surface, *surface;
+    struct wl_surface *ref;
+    HWND hwnd, desktop = NtUserGetDesktopWindow();
+    int placed = 0;
+
+    if (!(owner_data = wayland_win_data_get(owner))) return;
+    if (!(owner_surface = owner_data->wayland_surface) || !owner_surface->wl_surface)
+    {
+        wayland_win_data_release(owner_data);
+        return;
+    }
+    ref = owner_surface->client_ref ? owner_surface->client_ref : owner_surface->wl_surface;
+
+    /* walk the top-level windows from bottom-most to top-most */
+    hwnd = NtUserGetWindowRelative(desktop, GW_CHILD);
+    if (hwnd) hwnd = NtUserGetWindowRelative(hwnd, GW_HWNDLAST);
+    for (; hwnd; hwnd = NtUserGetWindowRelative(hwnd, GW_HWNDPREV))
+    {
+        if (hwnd == owner) continue;
+        if (!(data = wayland_win_data_get(hwnd))) continue;
+        if ((surface = data->wayland_surface) && surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+            surface->wl_subsurface && surface->owner_hwnd == owner)
+        {
+            wl_subsurface_place_above(surface->wl_subsurface, ref);
+            ref = surface->wl_surface;
+            placed++;
+        }
+        wayland_win_data_release(data);
+    }
+
+    TRACE("owner=%p %d popup(s) restacked above %s\n", owner, placed,
+          owner_surface->client_ref ? "client surface" : "owner");
+    wl_surface_commit(owner_surface->wl_surface);
+    wayland_win_data_release(owner_data);
+}
+
+/**********************************************************************
  *           WAYLAND_ActivateWindow
  *
  * Win32 activated a window: ask the compositor to give it keyboard focus.
