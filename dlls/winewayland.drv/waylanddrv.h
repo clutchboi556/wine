@@ -36,6 +36,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "xdg-activation-v1-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
@@ -185,6 +186,7 @@ struct wayland
     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
+    struct xdg_activation_v1 *xdg_activation_v1;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
     struct wayland_pointer pointer;
@@ -296,9 +298,16 @@ struct wayland_surface
         {
             struct wl_subsurface *wl_subsurface;
             HWND owner_hwnd;
+            BOOL placed;            /* stacked among its siblings once, on creation */
         };
     };
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
+    /* For a toplevel: the wl_surface of the client (GL/Vulkan) subsurface last
+     * attached under it, which owned popups must be stacked above, and the
+     * last popup placed on top, above which the next popup goes. Popups are
+     * validated through their HWND before use. */
+    struct wl_surface *client_ref;
+    HWND top_popup;
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
@@ -466,6 +475,7 @@ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWO
 void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small);
 void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
+void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);

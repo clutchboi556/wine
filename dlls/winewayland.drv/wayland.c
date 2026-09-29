@@ -210,6 +210,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_alpha_modifier_v1 =
             wl_registry_bind(registry, id, &wp_alpha_modifier_v1_interface, 1);
     }
+    else if (strcmp(interface, "xdg_activation_v1") == 0)
+    {
+        process_wayland.xdg_activation_v1 =
+            wl_registry_bind(registry, id, &xdg_activation_v1_interface, 1);
+    }
     else if (strcmp(interface, "wp_fractional_scale_manager_v1") == 0)
     {
         process_wayland.wp_fractional_scale_manager_v1 =
