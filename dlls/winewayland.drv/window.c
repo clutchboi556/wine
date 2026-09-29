@@ -372,6 +372,20 @@ static inline HWND get_active_window(void)
     return NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) ? info.hwndActive : 0;
 }
 
+/* Experimental: owned caption-less resizable windows (floating palettes) as
+ * toplevels, with their app-driven drags handed to the compositor. Off by
+ * default: the hand-off is not yet reliable (WINEWAYLAND_FLOATING_PALETTES=1). */
+static BOOL floating_palettes_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv("WINEWAYLAND_FLOATING_PALETTES");
+        enabled = env && *env && *env != '0';
+    }
+    return enabled;
+}
+
 /***********************************************************************
  *		is_window_managed
  *
@@ -463,7 +477,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * a toplevel can do; its app-driven moves and resizes are handed to the
      * compositor below. */
     if (managed && win_owner && !fullscreen && (style & WS_CAPTION) != WS_CAPTION &&
-        !(style & WS_THICKFRAME) &&
+        !(floating_palettes_enabled() && (style & WS_THICKFRAME)) &&
         !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
         managed = FALSE;
     if (!managed && surface) owner = owner_hint ? owner_hint : win_owner;
@@ -479,7 +493,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * pointer button is held on it is being dragged by the user through the
      * app's own code (custom title bars and grips: AutoCAD's palettes). The
      * compositor ignores client positions, so hand the drag to it. */
-    if (managed && surface && data->wayland_surface && (style & WS_VISIBLE) &&
+    if (floating_palettes_enabled() && managed && surface && data->wayland_surface && (style & WS_VISIBLE) &&
         wayland_surface_is_toplevel(data->wayland_surface))
     {
         const RECT *o = &data->rects.window, *n = &new_rects->window;
@@ -1048,10 +1062,13 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
                     xdg_toplevel_resize(surface->xdg_toplevel, wl_seat, button_serial,
                                         hittest_to_resize_edge(wparam & 0x0f));
                 }
+                /* the compositor does it; otherwise (a subsurface, or no button
+                 * press to hand over) leave it to win32u's own move/size loop,
+                 * which works for a subsurface since the app positions it */
+                ret = 0;
             }
             pthread_mutex_unlock(&process_wayland.seat.mutex);
             wayland_win_data_release(data);
-            ret = 0;
         }
     }
 
