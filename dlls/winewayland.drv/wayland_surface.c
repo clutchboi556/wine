@@ -423,6 +423,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
 {
     TRACE("surface=%p\n", surface);
 
+    if (surface->frame_cb)
+    {
+        wl_callback_destroy(surface->frame_cb);
+        surface->frame_cb = NULL;
+    }
+
     /* some objects are shared between several roles */
 
     if (surface->wp_fractional_scale_v1)

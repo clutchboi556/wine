@@ -23,6 +23,8 @@
 #endif
 
 #include "config.h"
+#include <errno.h>
+#include <poll.h>
 
 #include <stdlib.h>
 
@@ -107,9 +109,34 @@ err:
 
 static NTSTATUS waylanddrv_unix_read_events(void *arg)
 {
-    while (wl_display_dispatch_queue(process_wayland.wl_display,
-                                     process_wayland.wl_event_queue) != -1)
-        continue;
+    struct wl_display *display = process_wayland.wl_display;
+    struct wl_event_queue *queue = process_wayland.wl_event_queue;
+    struct pollfd pfd = { .fd = wl_display_get_fd(display), .events = POLLIN };
+
+    for (;;)
+    {
+        int ret;
+
+        while (wl_display_prepare_read_queue(display, queue) != 0)
+            if (wl_display_dispatch_queue_pending(display, queue) == -1) goto error;
+        wl_display_flush(display);
+
+        /* wake up in time to present contents whose frame callback never came */
+        ret = poll(&pfd, 1, wayland_has_pending_present() ? 8 : -1);
+        if (ret > 0 && (pfd.revents & POLLIN))
+        {
+            if (wl_display_read_events(display) == -1) goto error;
+        }
+        else
+        {
+            wl_display_cancel_read(display);
+            if (ret < 0 && errno != EINTR) goto error;
+        }
+        if (wl_display_dispatch_queue_pending(display, queue) == -1) goto error;
+        wayland_present_expired();
+    }
+
+error:
     /* This function only returns on a fatal error, e.g., if our connection
      * to the Wayland server is lost. */
     return STATUS_UNSUCCESSFUL;

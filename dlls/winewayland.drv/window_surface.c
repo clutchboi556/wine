@@ -400,14 +400,25 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     wayland_buffer_queue_add_damage(wws->wayland_buffer_queue, surface_damage_region);
 
-    shm_buffer = wayland_buffer_queue_get_free_buffer(wws->wayland_buffer_queue);
+    /* The latest contents may sit in a buffer that has not been committed
+     * yet (waiting for the surface's frame callback): keep drawing into it,
+     * only the new damage needs copying. */
+    latest_buffer = get_window_surface_contents(window_surface->hwnd);
+    if (latest_buffer && !latest_buffer->busy &&
+        latest_buffer->width == wws->wayland_buffer_queue->width &&
+        latest_buffer->height == wws->wayland_buffer_queue->height &&
+        latest_buffer->format == wws->wayland_buffer_queue->format)
+        shm_buffer = latest_buffer;
+    else
+        shm_buffer = wayland_buffer_queue_get_free_buffer(wws->wayland_buffer_queue);
     if (!shm_buffer)
     {
         ERR("failed to acquire Wayland SHM buffer, returning\n");
+        if (latest_buffer) wayland_shm_buffer_unref(latest_buffer);
         goto done;
     }
 
-    if ((latest_buffer = get_window_surface_contents(window_surface->hwnd)))
+    if (latest_buffer)
     {
         TRACE("latest_window_buffer=%p\n", latest_buffer);
         /* If we have a latest buffer, use it as the source of all pixel

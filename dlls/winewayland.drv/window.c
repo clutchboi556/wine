@@ -26,6 +26,8 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <time.h>
+#include "wine/list.h"
 
 #include "ntstatus.h"
 
@@ -51,6 +53,8 @@ static int wayland_win_data_cmp_rb(const void *key,
 
 static pthread_mutex_t win_data_mutex;
 static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
+
+static void pending_present_remove(HWND hwnd);
 
 /***********************************************************************
  *           wayland_win_data_create
@@ -102,6 +106,9 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
 
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
     if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
+    if (data->pending_contents) wayland_shm_buffer_unref(data->pending_contents);
+    pending_present_remove(data->hwnd);
+    if (data->pending_damage) NtGdiDeleteObjectApp(data->pending_damage);
     free(data);
 }
 
@@ -1123,6 +1130,144 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
     wayland_win_data_release(data);
 }
 
+/* Present one buffer per compositor frame: commit now and ask for a frame
+ * callback; until it arrives, later contents are only recorded (they keep
+ * accumulating in the same not-yet-committed buffer, see
+ * wayland_window_surface_flush) and go out in one commit at the callback.
+ * Apps that repaint in many small pieces (WPF resizing a palette: 600-900
+ * commits per second, a full buffer copy each) otherwise swamp the
+ * compositor and show every partial state. */
+static void frame_callback_done(void *data, struct wl_callback *callback, uint32_t time);
+static const struct wl_callback_listener frame_callback_listener = { frame_callback_done };
+
+static void request_frame_callback(struct wayland_surface *surface)
+{
+    surface->frame_cb = wl_surface_frame(surface->wl_surface);
+    wl_callback_add_listener(surface->frame_cb, &frame_callback_listener, surface->hwnd);
+}
+
+/* Windows with contents deferred to a frame callback, with the time of the
+ * deferral: a compositor does not send frame callbacks to a surface it does
+ * not render (occluded, or, in Hyprland's case, some subsurfaces), so the
+ * event loop presents what has waited longer than a frame anyway. */
+struct pending_present
+{
+    struct list entry;
+    HWND hwnd;
+    ULONGLONG since;
+};
+static struct list pending_presents = LIST_INIT(pending_presents);
+static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static ULONGLONG monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void pending_present_add(HWND hwnd)
+{
+    struct pending_present *p;
+    pthread_mutex_lock(&pending_mutex);
+    LIST_FOR_EACH_ENTRY(p, &pending_presents, struct pending_present, entry)
+        if (p->hwnd == hwnd) goto done;
+    if ((p = malloc(sizeof(*p))))
+    {
+        p->hwnd = hwnd;
+        p->since = monotonic_ms();
+        list_add_tail(&pending_presents, &p->entry);
+    }
+done:
+    pthread_mutex_unlock(&pending_mutex);
+}
+
+static void pending_present_remove(HWND hwnd)
+{
+    struct pending_present *p;
+    pthread_mutex_lock(&pending_mutex);
+    LIST_FOR_EACH_ENTRY(p, &pending_presents, struct pending_present, entry)
+        if (p->hwnd == hwnd) { list_remove(&p->entry); free(p); break; }
+    pthread_mutex_unlock(&pending_mutex);
+}
+
+BOOL wayland_has_pending_present(void)
+{
+    BOOL ret;
+    pthread_mutex_lock(&pending_mutex);
+    ret = !list_empty(&pending_presents);
+    pthread_mutex_unlock(&pending_mutex);
+    return ret;
+}
+
+/* present a window's deferred contents now (win data held by the caller) */
+static void present_pending(struct wayland_win_data *data, struct wayland_surface *surface)
+{
+    if (surface->frame_cb)
+    {
+        wl_callback_destroy(surface->frame_cb);
+        surface->frame_cb = NULL;
+    }
+    if (wayland_surface_reconfigure(surface))
+    {
+        wayland_surface_attach_shm(surface, data->pending_contents, data->pending_damage);
+        wl_surface_commit(surface->wl_surface);
+        request_frame_callback(surface);
+        wl_display_flush(process_wayland.wl_display);
+    }
+    wayland_shm_buffer_unref(data->pending_contents);
+    data->pending_contents = NULL;
+    NtGdiSetRectRgn(data->pending_damage, 0, 0, 0, 0);
+    pending_present_remove(data->hwnd);
+}
+
+/* called by the event loop: present whatever has waited more than a frame */
+void wayland_present_expired(void)
+{
+    ULONGLONG now = monotonic_ms();
+    HWND expired[32];
+    int n = 0, i;
+    struct pending_present *p;
+
+    pthread_mutex_lock(&pending_mutex);
+    LIST_FOR_EACH_ENTRY(p, &pending_presents, struct pending_present, entry)
+        if (now - p->since >= 16 && n < ARRAY_SIZE(expired)) expired[n++] = p->hwnd;
+    pthread_mutex_unlock(&pending_mutex);
+
+    for (i = 0; i < n; i++)
+    {
+        struct wayland_win_data *data = wayland_win_data_get(expired[i]);
+        if (!data) { pending_present_remove(expired[i]); continue; }
+        if (data->pending_contents && data->wayland_surface)
+        {
+            TRACE("hwnd=%p frame callback overdue, presenting\n", expired[i]);
+            present_pending(data, data->wayland_surface);
+        }
+        else pending_present_remove(expired[i]);
+        wayland_win_data_release(data);
+    }
+}
+
+static void frame_callback_done(void *arg, struct wl_callback *callback, uint32_t time)
+{
+    HWND hwnd = arg;
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+
+    data = wayland_win_data_get(hwnd);
+    TRACE("hwnd=%p pending=%p\n", hwnd, data ? data->pending_contents : NULL);
+    if (data)
+    {
+        if ((surface = data->wayland_surface) && surface->frame_cb == callback)
+        {
+            surface->frame_cb = NULL;
+            if (data->pending_contents) present_pending(data, surface);
+        }
+        wayland_win_data_release(data);
+    }
+    wl_callback_destroy(callback);
+}
+
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
 {
     struct wayland_surface *wayland_surface;
@@ -1133,16 +1278,31 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 
     if ((wayland_surface = data->wayland_surface))
     {
-        if (wayland_surface_reconfigure(wayland_surface))
+        if (!wayland_surface_reconfigure(wayland_surface))
         {
-            wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
-            wl_surface_commit(wayland_surface->wl_surface);
+            TRACE("Wayland surface not configured yet, not flushing\n");
+        }
+        else if (wayland_surface->frame_cb)
+        {
+            /* a frame is in flight: present these contents at its callback */
+            TRACE("hwnd=%p deferring %p to the frame callback\n", hwnd, shm_buffer);
+            if (data->pending_contents != shm_buffer)
+            {
+                if (data->pending_contents) wayland_shm_buffer_unref(data->pending_contents);
+                wayland_shm_buffer_ref((data->pending_contents = shm_buffer));
+            }
+            if (!data->pending_damage) data->pending_damage = NtGdiCreateRectRgn(0, 0, 0, 0);
+            NtGdiCombineRgn(data->pending_damage, data->pending_damage, damage_region, RGN_OR);
+            pending_present_add(hwnd);
             committed = TRUE;
-            if (data->drag_pending) wayland_start_compositor_drag(data);
         }
         else
         {
-            TRACE("Wayland surface not configured yet, not flushing\n");
+            wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+            wl_surface_commit(wayland_surface->wl_surface);
+            request_frame_callback(wayland_surface);
+            committed = TRUE;
+            if (data->drag_pending) wayland_start_compositor_drag(data);
         }
     }
 
