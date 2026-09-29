@@ -645,6 +645,105 @@ static void wayland_configure_window(HWND hwnd)
 }
 
 /**********************************************************************
+ *           WAYLAND_ActivateWindow
+ *
+ * Win32 activated a window: ask the compositor to give it keyboard focus.
+ * Wayland clients cannot take focus themselves; xdg-activation lets us ask
+ * for it with a token derived from the last input event we received, which
+ * compositors honour (Hyprland with focus_on_activate, KDE, GNOME with its
+ * focus-stealing rules).  Without this a modal dialog opened by the
+ * application only gets keyboard input once the pointer moves over it.
+ */
+struct activation_request
+{
+    HWND hwnd;
+};
+
+static void activation_token_handle_done(void *data, struct xdg_activation_token_v1 *token,
+                                         const char *token_str)
+{
+    struct activation_request *req = data;
+    struct wayland_win_data *win;
+    struct wayland_surface *surface;
+
+    if ((win = wayland_win_data_get(req->hwnd)))
+    {
+        if ((surface = win->wayland_surface) && surface->wl_surface &&
+            wayland_surface_is_toplevel(surface))
+        {
+            TRACE("hwnd=%p token=%s\n", req->hwnd, token_str);
+            xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token_str,
+                                       surface->wl_surface);
+            wl_display_flush(process_wayland.wl_display);
+        }
+        wayland_win_data_release(win);
+    }
+    xdg_activation_token_v1_destroy(token);
+    free(req);
+}
+
+static const struct xdg_activation_token_v1_listener activation_token_listener =
+{
+    activation_token_handle_done
+};
+
+void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    struct xdg_activation_token_v1 *token;
+    struct activation_request *req;
+    HWND focused;
+    uint32_t serial;
+    BOOL ok;
+
+    if (!process_wayland.xdg_activation_v1) return;
+
+    /* The compositor already gave this window keyboard focus (this is how
+     * our own WM_WAYLAND_SET_FOREGROUND ends up here). */
+    pthread_mutex_lock(&process_wayland.keyboard.mutex);
+    focused = process_wayland.keyboard.focused_hwnd;
+    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+    if (focused == hwnd) return;
+
+    /* Only ask on behalf of an input event we received: a token without a
+     * serial is a focus-stealing request (a freshly launched program pulling
+     * the user to its workspace), and compositors that don't reject it
+     * would let every Wine launch do that. */
+    serial = InterlockedCompareExchange(&process_wayland.input_serial, 0, 0);
+    if (!serial) return;
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    surface = data->wayland_surface;
+    ok = surface && surface->wl_surface && wayland_surface_is_toplevel(surface) && data->managed;
+    wayland_win_data_release(data);
+    if (!ok) return;
+
+    if (!(req = malloc(sizeof(*req)))) return;
+    req->hwnd = hwnd;
+    token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1);
+    xdg_activation_token_v1_add_listener(token, &activation_token_listener, req);
+
+    pthread_mutex_lock(&process_wayland.seat.mutex);
+    if (process_wayland.seat.wl_seat)
+        xdg_activation_token_v1_set_serial(token, serial, process_wayland.seat.wl_seat);
+    pthread_mutex_unlock(&process_wayland.seat.mutex);
+
+    /* the surface that currently has focus, if it is ours, vouches for the request */
+    if (focused && (data = wayland_win_data_get(focused)))
+    {
+        if ((surface = data->wayland_surface) && surface->wl_surface)
+            xdg_activation_token_v1_set_surface(token, surface->wl_surface);
+        wayland_win_data_release(data);
+    }
+
+    xdg_activation_token_v1_commit(token);
+    wl_display_flush(process_wayland.wl_display);
+
+    TRACE("hwnd=%p previous=%p focused=%p serial=%u\n", hwnd, previous, focused, serial);
+}
+
+/**********************************************************************
  *           WAYLAND_WindowMessage
  */
 LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -681,6 +780,8 @@ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWO
 {
     struct wayland_win_data *data;
     struct wayland_surface *surface;
+
+    TRACE("hwnd=%p key=%#x alpha=%u flags=%#x\n", hwnd, (UINT)key, alpha, (UINT)flags);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
 
@@ -833,6 +934,7 @@ void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)
     struct wayland_win_data *data;
     struct wayland_surface *surface;
 
+    TRACE("hwnd=%p alpha=%u flags=%#x\n", hwnd, alpha, flags);
     if (!(data = wayland_win_data_get(hwnd))) return;
 
     if ((surface = data->wayland_surface))

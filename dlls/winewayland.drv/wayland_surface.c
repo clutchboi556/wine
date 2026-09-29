@@ -397,6 +397,7 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
 
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     surface->owner_hwnd = owner->hwnd;
+    surface->placed = FALSE;
 
     /* Present contents independently of the owner surface. */
     wl_subsurface_set_desync(surface->wl_subsurface);
@@ -776,10 +777,38 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
         TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
 
         wl_subsurface_set_position(surface->wl_subsurface, rect.left, rect.top);
-        if (owner_data->client_surface && owner_data->client_surface->wl_subsurface)
-            wl_subsurface_place_above(surface->wl_subsurface, owner_data->client_surface->wl_surface);
-        else
-            wl_subsurface_place_above(surface->wl_subsurface, owner_surface->wl_surface);
+
+        /* Stack a new popup on top of its siblings: above the last popup we
+         * placed, else above the owner's client (GL/Vulkan) subsurface, else
+         * directly above the owner. place_above(owner) alone would put it
+         * *below* every existing sibling, including the client surface of
+         * the drawing area, which then shows through it (AutoCAD's context
+         * menus came out as ghosts under its DX12 view). */
+        if (!surface->placed)
+        {
+            struct wl_surface *ref = NULL;
+            struct wayland_win_data *top_data;
+
+            if (owner_surface->top_popup && owner_surface->top_popup != surface->hwnd &&
+                (top_data = wayland_win_data_get(owner_surface->top_popup)))
+            {
+                struct wayland_surface *top = top_data->wayland_surface;
+                if (top && top->role == WAYLAND_SURFACE_ROLE_SUBSURFACE && top->wl_subsurface &&
+                    top->owner_hwnd == owner_surface->hwnd)
+                    ref = top->wl_surface;
+                wayland_win_data_release(top_data);
+            }
+            if (!ref && owner_data->client_surface && owner_data->client_surface->wl_subsurface)
+                ref = owner_data->client_surface->wl_surface;
+            if (!ref) ref = owner_surface->client_ref;
+            if (!ref) ref = owner_surface->wl_surface;
+
+            TRACE("hwnd=%p placed above %p (%s)\n", surface->hwnd, ref,
+                  ref == owner_surface->wl_surface ? "owner" : "sibling");
+            wl_subsurface_place_above(surface->wl_subsurface, ref);
+            owner_surface->top_popup = surface->hwnd;
+            surface->placed = TRUE;
+        }
         wl_surface_commit(owner_surface->wl_surface);
 
         memset(&surface->processing, 0, sizeof(surface->processing));
@@ -1294,6 +1323,12 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
             client->wl_subsurface = NULL;
         }
 
+        if (client->toplevel && (toplevel_data = wayland_win_data_get(client->toplevel)))
+        {
+            if ((surface = toplevel_data->wayland_surface) && surface->client_ref == client->wl_surface)
+                surface->client_ref = NULL;
+            wayland_win_data_release(toplevel_data);
+        }
         client->toplevel = 0;
         return;
     }
@@ -1318,6 +1353,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         wl_subsurface_set_desync(client->wl_subsurface);
 
         client->toplevel = toplevel;
+        surface->client_ref = client->wl_surface;
     }
 
     wayland_surface_reconfigure_client(surface, client, rect);
@@ -1491,6 +1527,8 @@ void wayland_surface_assign_icon(struct wayland_surface *surface)
 
 void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags)
 {
+    TRACE("hwnd=%p alpha=%u flags=%#x modifier=%p\n", surface->hwnd, alpha, flags,
+          surface->wp_alpha_modifier_surface_v1);
     if (surface->wp_alpha_modifier_surface_v1)
     {
         uint32_t opacity = (flags & LWA_ALPHA) ? (UINT32_MAX / 0xff) * alpha : UINT32_MAX;
