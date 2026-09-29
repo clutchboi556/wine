@@ -447,6 +447,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
      * applied through wp_alpha_modifier and the color key through the shape. */
     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
                                  !(wws->layered && window_surface->alpha_mask));
+
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
