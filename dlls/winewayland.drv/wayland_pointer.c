@@ -147,12 +147,11 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
     screen = map_point_from_surface(surface, screen);
     screen.x += window_rect->left;
     screen.y += window_rect->top;
-    /* Sometimes, due to rounding, we may end up with pointer coordinates
-     * slightly outside the target window, so bring them within bounds. */
-    if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
-    else if (screen.x < window_rect->left) screen.x = window_rect->left;
-    if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
-    else if (screen.y < window_rect->top) screen.y = window_rect->top;
+    /* Don't clamp the position into the window: while a button is held the
+     * compositor keeps sending motion to the surface wherever the pointer
+     * goes (implicit grab), and an app dragging or resizing its window by an
+     * edge needs exactly those positions outside the current rect. Clamping
+     * them made drags towards the grabbed edge crawl. */
 
     wayland_win_data_release(data);
 
