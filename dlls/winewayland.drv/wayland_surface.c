@@ -26,6 +26,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "waylanddrv.h"
@@ -511,6 +512,29 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
 
     shm_buffer->busy = TRUE;
     wayland_shm_buffer_ref(shm_buffer);
+
+    /* WINEWAYLAND_DUMP_SHM=<dir>: keep a copy of every subsurface buffer as
+     * it goes to the compositor (raw BGRA, size in the file name) */
+    {
+        static const char *dump_dir;
+        static int dump_seq = -1;
+        if (dump_seq < 0) { dump_dir = getenv("WINEWAYLAND_DUMP_SHM"); dump_seq = 0; }
+        if (dump_dir && surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE && dump_seq < 500 &&
+            surface->window.rect.bottom - surface->window.rect.top >= 200 &&
+            surface->window.rect.right - surface->window.rect.left >= 900)
+        {
+            char path[256];
+            int fd, ww = surface->window.rect.right - surface->window.rect.left,
+                    wh = surface->window.rect.bottom - surface->window.rect.top;
+            snprintf(path, sizeof(path), "%s/%04d-%p-%dx%d-win%dx%d.bgra", dump_dir, dump_seq++,
+                     surface->hwnd, shm_buffer->width, shm_buffer->height, ww, wh);
+            if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644)) >= 0)
+            {
+                write(fd, shm_buffer->map_data, (size_t)shm_buffer->width * shm_buffer->height * 4);
+                close(fd);
+            }
+        }
+    }
 
     wl_surface_attach(surface->wl_surface, shm_buffer->wl_buffer, 0, 0);
 

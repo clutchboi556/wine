@@ -1198,6 +1198,13 @@ static void update_visible_region( struct dce *dce )
     }
 
     if (!surface) SetRectEmpty( &top_rect );
+    if (TRACE_ON(win))
+    {
+        RECT box;
+        NtGdiGetRgnBox( vis_rgn, &box );
+        TRACE( "hwnd %p hdc %p flags %08x vis %s win_rect %s top %p top_rect %s surface %p\n", dce->hwnd, dce->hdc,
+               flags, wine_dbgstr_rect( &box ), wine_dbgstr_rect( &win_rect ), top_win, wine_dbgstr_rect( &top_rect ), surface );
+    }
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
 }
