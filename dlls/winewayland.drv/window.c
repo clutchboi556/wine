@@ -30,6 +30,7 @@
 #include "ntstatus.h"
 
 #include "waylanddrv.h"
+#include "wine/server.h"
 
 #include "wine/debug.h"
 
@@ -454,10 +455,15 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * acquire the lock itself internally. */
     managed = is_window_managed(hwnd, swp_flags, fullscreen);
     if (win_owner) win_owner = NtUserGetAncestor(win_owner, GA_ROOT);
-    /* Owned windows without a caption (tool windows, palettes, notification
-     * bubbles) belong to their owner's surface even when they are activated:
-     * as separate toplevels they could be neither positioned nor kept over it. */
+    /* Owned windows without a caption (command line, notification bubbles,
+     * menus, tooltips) belong to their owner's surface even when they are
+     * activated: as separate toplevels they could be neither positioned nor
+     * kept over it. A *resizable* one (WS_THICKFRAME: a floating palette) is
+     * a real window the user drags around and onto other monitors, which only
+     * a toplevel can do; its app-driven moves and resizes are handed to the
+     * compositor below. */
     if (managed && win_owner && !fullscreen && (style & WS_CAPTION) != WS_CAPTION &&
+        !(style & WS_THICKFRAME) &&
         !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
         managed = FALSE;
     if (!managed && surface) owner = owner_hint ? owner_hint : win_owner;
@@ -468,6 +474,40 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (!(data = wayland_win_data_get(hwnd))) return;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
+
+    /* A managed toplevel that the application moves or resizes while the
+     * pointer button is held on it is being dragged by the user through the
+     * app's own code (custom title bars and grips: AutoCAD's palettes). The
+     * compositor ignores client positions, so hand the drag to it. */
+    if (managed && surface && data->wayland_surface && (style & WS_VISIBLE) &&
+        wayland_surface_is_toplevel(data->wayland_surface))
+    {
+        const RECT *o = &data->rects.window, *n = &new_rects->window;
+        BOOL moved = (o->left != n->left || o->top != n->top) &&
+                     (o->right - o->left == n->right - n->left) && (o->bottom - o->top == n->bottom - n->top);
+        BOOL resized = (o->right - o->left != n->right - n->left) || (o->bottom - o->top != n->bottom - n->top);
+        BOOL held;
+
+        pthread_mutex_lock(&process_wayland.pointer.mutex);
+        held = process_wayland.pointer.button_serial && process_wayland.pointer.focused_hwnd == hwnd;
+        pthread_mutex_unlock(&process_wayland.pointer.mutex);
+
+        if (held && (moved || resized) && !(swp_flags & SWP_NOSENDCHANGING))
+        {
+            UINT edge = XDG_TOPLEVEL_RESIZE_EDGE_NONE;
+            if (resized)
+            {
+                if (n->top != o->top) edge |= XDG_TOPLEVEL_RESIZE_EDGE_TOP;
+                if (n->bottom != o->bottom) edge |= XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
+                if (n->left != o->left) edge |= XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
+                if (n->right != o->right) edge |= XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
+            }
+            data->drag_pending = TRUE;
+            data->drag_is_resize = resized;
+            data->drag_resize_edge = edge;
+            TRACE("hwnd %p: app %s with button held, handing to the compositor\n", hwnd, resized ? "resize" : "move");
+        }
+    }
 
     data->rects = *new_rects;
     data->is_fullscreen = fullscreen;
@@ -487,8 +527,53 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         wayland_win_data_update_wayland_state(data);
     }
 
+    /* an already mapped toplevel can hand the drag over right away; a new one
+     * does it from set_window_surface_contents once its first buffer is up */
+    if (data->drag_pending && data->window_contents) wayland_start_compositor_drag(data);
+
     if (owner_data) wayland_win_data_release(owner_data);
     wayland_win_data_release(data);
+}
+
+/**********************************************************************
+ *           wayland_start_compositor_drag
+ *
+ * Turn the application's own move/resize drag of a toplevel into a
+ * compositor interactive move/resize, and end the application's drag with a
+ * synthesized button release: it will get no more pointer events until the
+ * compositor is done, and never the release itself.
+ */
+void wayland_start_compositor_drag(struct wayland_win_data *data)
+{
+    struct wayland_surface *surface = data->wayland_surface;
+    struct wl_seat *wl_seat;
+    uint32_t serial = 0;
+    INPUT input = {0};
+
+    data->drag_pending = FALSE;
+    if (!surface || !wayland_surface_is_toplevel(surface)) return;
+
+    pthread_mutex_lock(&process_wayland.pointer.mutex);
+    if (process_wayland.pointer.focused_hwnd == data->hwnd) serial = process_wayland.pointer.button_serial;
+    process_wayland.pointer.button_serial = 0;
+    pthread_mutex_unlock(&process_wayland.pointer.mutex);
+    if (!serial) return;
+
+    pthread_mutex_lock(&process_wayland.seat.mutex);
+    if ((wl_seat = process_wayland.seat.wl_seat))
+    {
+        if (data->drag_is_resize)
+            xdg_toplevel_resize(surface->xdg_toplevel, wl_seat, serial, data->drag_resize_edge);
+        else
+            xdg_toplevel_move(surface->xdg_toplevel, wl_seat, serial);
+    }
+    pthread_mutex_unlock(&process_wayland.seat.mutex);
+    wl_display_flush(process_wayland.wl_display);
+    TRACE("hwnd %p: compositor %s started (serial %u)\n", data->hwnd, data->drag_is_resize ? "resize" : "move", serial);
+
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    NtUserSendHardwareInput(data->hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
 }
 
 static void wayland_configure_window(HWND hwnd)
@@ -1036,6 +1121,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
             wl_surface_commit(wayland_surface->wl_surface);
             committed = TRUE;
+            if (data->drag_pending) wayland_start_compositor_drag(data);
         }
         else
         {

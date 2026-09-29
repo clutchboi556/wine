@@ -395,6 +395,11 @@ struct wayland_win_data
     BOOL resizeable;
     BOOL managed;
     BOOL layered_attribs_set;
+    /* the application is moving/resizing this toplevel with the pointer
+     * button held: hand the drag to the compositor once the surface is mapped */
+    BOOL drag_pending;
+    BOOL drag_is_resize;
+    UINT drag_resize_edge;
 };
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
@@ -474,6 +479,7 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 void wayland_restack_popups(HWND owner);
+void wayland_start_compositor_drag(struct wayland_win_data *data);
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);
