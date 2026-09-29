@@ -312,6 +312,9 @@ struct wayland_surface
      * rect, not with the rect the app has just asked for. */
     RECT pointer_rect;
     BOOL pointer_rect_valid;
+    /* frame callback of the last commit: while it is pending, new contents
+     * accumulate and are presented at the callback (one commit per frame) */
+    struct wl_callback *frame_cb;
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;
@@ -392,6 +395,9 @@ struct wayland_win_data
     HWND hwnd;
     /* last buffer that was set as window contents */
     struct wayland_shm_buffer *window_contents;
+    /* contents (and their damage) waiting for the surface's frame callback */
+    struct wayland_shm_buffer *pending_contents;
+    HRGN pending_damage;
     /* wayland surface (if any) for this window */
     struct wayland_surface *wayland_surface;
     /* wayland client surface (if any) for this window */
@@ -487,6 +493,8 @@ void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 void wayland_restack_popups(HWND owner);
 void wayland_start_compositor_drag(struct wayland_win_data *data);
+void wayland_present_expired(void);
+BOOL wayland_has_pending_present(void);
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);
