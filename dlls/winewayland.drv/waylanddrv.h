@@ -305,6 +305,13 @@ struct wayland_surface
     /* For a toplevel: the wl_surface of the client (GL/Vulkan) subsurface last
      * attached under it; owned popups are stacked above it. */
     struct wl_surface *client_ref;
+    /* For a subsurface: the window rect as the compositor has applied it so
+     * far (subsurface positions apply on the parent's commit, which the
+     * compositor may not have processed when the next pointer event was
+     * generated). Pointer motion is mapped to screen coordinates with this
+     * rect, not with the rect the app has just asked for. */
+    RECT pointer_rect;
+    BOOL pointer_rect_valid;
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;

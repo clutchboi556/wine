@@ -139,7 +139,10 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
         return;
     }
 
-    window_rect = &surface->window.rect;
+    /* A subsurface the app is moving: use the position the compositor has
+     * actually applied, or each move is counted twice (once by the app, once
+     * through the shifted frame of the events) and drags run away. */
+    window_rect = surface->pointer_rect_valid ? &surface->pointer_rect : &surface->window.rect;
 
     screen = map_point_from_surface(surface, screen);
     screen.x += window_rect->left;

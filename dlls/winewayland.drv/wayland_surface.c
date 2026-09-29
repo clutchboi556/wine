@@ -398,6 +398,7 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     surface->owner_hwnd = owner->hwnd;
     surface->placed = FALSE;
+    surface->pointer_rect_valid = FALSE;
 
     /* Present contents independently of the owner surface. */
     wl_subsurface_set_desync(surface->wl_subsurface);
@@ -753,6 +754,55 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     return TRUE;
 }
 
+/* Learn when the compositor has applied a subsurface position: a sync
+ * callback issued after the parent's commit is answered once the compositor
+ * has processed everything before it. */
+struct pointer_rect_sync
+{
+    HWND hwnd;
+    RECT rect;
+};
+
+static void pointer_rect_sync_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+    struct pointer_rect_sync *sync = data;
+    struct wayland_win_data *win;
+
+    if ((win = wayland_win_data_get(sync->hwnd)))
+    {
+        if (win->wayland_surface)
+        {
+            win->wayland_surface->pointer_rect = sync->rect;
+            win->wayland_surface->pointer_rect_valid = TRUE;
+        }
+        wayland_win_data_release(win);
+    }
+    wl_callback_destroy(callback);
+    free(sync);
+}
+
+static const struct wl_callback_listener pointer_rect_sync_listener = { pointer_rect_sync_done };
+
+static void wayland_surface_sync_pointer_rect(struct wayland_surface *surface)
+{
+    struct pointer_rect_sync *sync;
+    struct wl_display *wrapper;
+    struct wl_callback *callback;
+
+    if (surface->pointer_rect_valid && EqualRect(&surface->pointer_rect, &surface->window.rect)) return;
+    if (!(sync = malloc(sizeof(*sync)))) return;
+    sync->hwnd = surface->hwnd;
+    sync->rect = surface->window.rect;
+
+    /* the callback must live on the driver's event queue, like every other object */
+    if (!(wrapper = wl_proxy_create_wrapper(process_wayland.wl_display))) { free(sync); return; }
+    wl_proxy_set_queue((struct wl_proxy *)wrapper, process_wayland.wl_event_queue);
+    callback = wl_display_sync(wrapper);
+    wl_proxy_wrapper_destroy(wrapper);
+    if (!callback) { free(sync); return; }
+    wl_callback_add_listener(callback, &pointer_rect_sync_listener, sync);
+}
+
 /**********************************************************************
  *          wayland_surface_reconfigure_subsurface
  *
@@ -791,6 +841,7 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
             wayland_restack_popups(owner_surface->hwnd);
         }
         wl_surface_commit(owner_surface->wl_surface);
+        wayland_surface_sync_pointer_rect(surface);
 
         memset(&surface->processing, 0, sizeof(surface->processing));
     }
