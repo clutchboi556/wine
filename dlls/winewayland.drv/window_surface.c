@@ -26,6 +26,8 @@
 
 #include <limits.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "waylanddrv.h"
 #include "wine/debug.h"
@@ -388,6 +390,27 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         goto done;
     }
 
+    /* WINEWAYLAND_DUMP_SHM=<dir>: also keep the window bitmap as win32u hands it
+     * to us (raw BGRA), with this flush's dirty rect in the file name */
+    {
+        static const char *dump_dir;
+        static int dump_seq = -1;
+        int w = surface_rect.right, h = surface_rect.bottom;
+        if (dump_seq < 0) { dump_dir = getenv("WINEWAYLAND_DUMP_SHM"); dump_seq = 0; }
+        if (dump_dir && h >= 200 && w >= 900 && w < 1800 && dump_seq < 500)
+        {
+            char path[256];
+            int fd;
+            snprintf(path, sizeof(path), "%s/dib-%04d-%p-%dx%d-dirty%d_%d_%d_%d.bgra", dump_dir, dump_seq++,
+                     window_surface->hwnd, w, h, dirty->left, dirty->top, dirty->right, dirty->bottom);
+            if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644)) >= 0)
+            {
+                write(fd, color_bits, (size_t)w * h * 4);
+                close(fd);
+            }
+        }
+    }
+
     buffer_format = (shape_bits || wws->layered) ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
     if (wws->wayland_buffer_queue->format != buffer_format)
     {
@@ -542,6 +565,13 @@ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_re
     if (previous) window_surface_release(previous);
 
     if (layered) data->layered_attribs_set = TRUE;
+    /* contents deferred from the previous surface (another size) are stale */
+    if (data->pending_contents)
+    {
+        wayland_shm_buffer_unref(data->pending_contents);
+        data->pending_contents = NULL;
+        if (data->pending_damage) NtGdiSetRectRgn(data->pending_damage, 0, 0, 0, 0);
+    }
     *surface = wayland_window_surface_create(data->hwnd, surface_rect, layered);
 
     wayland_win_data_release(data);
