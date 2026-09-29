@@ -323,6 +323,9 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
          * we use the config fields to mark them as updated. */
         surface->processing.serial = 1;
         surface->processing.processed = TRUE;
+        /* A move alone brings no new contents, so nothing would push the new
+         * position to the compositor until the next paint: apply it now. */
+        if (data->window_contents) wayland_surface_reconfigure(surface);
         break;
     }
 
@@ -1203,12 +1206,21 @@ BOOL wayland_has_pending_present(void)
 /* present a window's deferred contents now (win data held by the caller) */
 static void present_pending(struct wayland_win_data *data, struct wayland_surface *surface)
 {
+    int win_width = surface->window.rect.right - surface->window.rect.left;
+    int win_height = surface->window.rect.bottom - surface->window.rect.top;
+
     if (surface->frame_cb)
     {
         wl_callback_destroy(surface->frame_cb);
         surface->frame_cb = NULL;
     }
-    if (wayland_surface_reconfigure(surface))
+    /* a buffer deferred before a resize can be smaller than the window now;
+     * presenting it would sample past its end (stripes) - the resize brings
+     * new contents anyway */
+    if (data->pending_contents->width < win_width || data->pending_contents->height < win_height)
+        TRACE("hwnd=%p dropping stale %dx%d contents for a %dx%d window\n", data->hwnd,
+              data->pending_contents->width, data->pending_contents->height, win_width, win_height);
+    else if (wayland_surface_reconfigure(surface))
     {
         wayland_surface_attach_shm(surface, data->pending_contents, data->pending_damage);
         wl_surface_commit(surface->wl_surface);
