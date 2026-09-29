@@ -2747,7 +2747,9 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         swp_flags &= ~SWP_NOSIZE;
     }
 
-    TRACE( "window %p new_rects %s\n", hwnd, debugstr_window_rects( &new_rects ) );
+    TRACE( "window %p new_rects %s flags %#x blend op %u src_alpha %u format %#x\n", hwnd,
+           debugstr_window_rects( &new_rects ), (UINT)flags, blend ? blend->BlendOp : 0,
+           source_alpha, blend ? blend->AlphaFormat : 0 );
 
     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
@@ -2787,7 +2789,14 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         window_surface_unlock( surface );
 
         if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
-        window_surface_set_layered( surface, key, -1, 0xff000000 );
+        /* The source bitmap's alpha channel only counts with AC_SRC_ALPHA.
+         * Otherwise the window is opaque (times the constant alpha), whatever
+         * the alpha bytes happen to hold - AutoCAD's context menus and
+         * command line are drawn that way and came out see-through. */
+        if ((flags & ULW_ALPHA) && blend && (blend->AlphaFormat & AC_SRC_ALPHA))
+            window_surface_set_layered( surface, key, -1, 0xff000000 );
+        else
+            window_surface_set_layered( surface, key, 0xff000000, 0 );
 
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
         window_surface_flush( surface );
