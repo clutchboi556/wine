@@ -4324,6 +4324,22 @@ static void test_replaceChild(void)
     ok(hr == E_FAIL, "Unexpected hr %#lx.\n", hr);
     ok( removed_node == NULL, "%p\n", removed_node );
 
+    /* replacing a child with itself is a no-op: the node must stay attached
+       (without this, insert-before-self links the node's list entry to itself,
+       corrupting the parent's child list so it can never be serialized again --
+       AutoCAD's Profile.aws save then writes the same block forever) */
+    removed_node = (void*)0xdeadbeef;
+    hr = IXMLDOMElement_replaceChild( element, fo_node, fo_node, &removed_node );
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(removed_node != NULL && removed_node != (void*)0xdeadbeef, "removed_node %p\n", removed_node);
+    if (removed_node && removed_node != (void*)0xdeadbeef) IXMLDOMNode_Release( removed_node );
+
+    temp_node = NULL;
+    hr = IXMLDOMNode_get_parentNode( fo_node, &temp_node );
+    ok(hr == S_OK, "node was detached by replaceChild(n, n), hr %#lx.\n", hr);
+    ok(temp_node != NULL, "got %p\n", temp_node);
+    if (temp_node) IXMLDOMNode_Release( temp_node );
+
     hr = IXMLDOMElement_replaceChild( element, ba_node, fo_node, NULL );
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 

@@ -637,6 +637,34 @@ HRESULT node_insert_before(struct domnode *node, IXMLDOMNode *new_child, const V
         return E_FAIL;
     }
 
+    /* Reject inserting a node into itself or into one of its own descendants.
+     * Windows raises HIERARCHY_REQUEST_ERR; without the check the child is
+     * linked into its own subtree and the tree can never be walked or
+     * serialized again. */
+    {
+        struct domnode *ancestor = node;
+        while (ancestor)
+        {
+            if (ancestor == child_node)
+            {
+                WARN("Attempt to insert node %p into its own subtree (%p).\n", child_node, node);
+                return E_FAIL;
+            }
+            ancestor = ancestor->parent;
+        }
+    }
+
+    /* Inserting a node before itself is a no-op (referenceChild == newChild). */
+    if (ref_node == child_node)
+    {
+        if (ret)
+        {
+            *ret = new_child;
+            IXMLDOMNode_AddRef(*ret);
+        }
+        return S_OK;
+    }
+
     domnode_insert_domnode(node, child_node, ref_node);
 
     if (ret)
@@ -671,6 +699,20 @@ HRESULT node_replace_child(struct domnode *node, IXMLDOMNode *newChild, IXMLDOMN
     {
         WARN("Node %p is not a child of %p.\n", old_child, node);
         return E_INVALIDARG;
+    }
+
+    /* replaceChild(n, n) is a no-op.  Without this, node_insert_before() below
+     * is called with referenceChild == newChild and links the node's own list
+     * entry to itself, leaving the parent's child list corrupt (endless
+     * serialization, e.g. AutoCAD's Profile.aws save loop). */
+    if (new_child == old_child)
+    {
+        if (ret)
+        {
+            *ret = oldChild;
+            IXMLDOMNode_AddRef(*ret);
+        }
+        return S_OK;
     }
 
     curr = node;
