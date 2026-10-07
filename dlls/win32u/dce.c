@@ -931,6 +931,74 @@ void window_surface_unlock( struct window_surface *surface )
     pthread_mutex_unlock( &surface->mutex );
 }
 
+static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child );
+
+/* Commit coalescing for a palette-style popup while it is invalid: with the
+ * Wayland driver a flush becomes at most one commit per compositor frame (and
+ * each commit copies the whole window), so a resize storm shows a stale-bordered
+ * frame per step and pays a full copy for each of them.  Hold such a window's
+ * flushes for up to the configured number of milliseconds so a few settled
+ * frames reach the compositor instead.  A hold is per window and bounded, and
+ * the flush is never held back once the window has no invalid content, so the
+ * frame it settles on is always presented.
+ *
+ * @@@ Wine registry key: HKCU\Software\Wine\Wayland Driver
+ * @@ Wine registry value: PaletteCommitDeferMs (REG_DWORD, 0 = off, 100 is a
+ * good value for AutoCAD's tool palettes) */
+static int palette_commit_defer_ms(void)
+{
+    static int ms = -1;
+    char buffer[FIELD_OFFSET( KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(DWORD)] )];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+    HKEY key;
+
+    if (ms >= 0) return ms;
+    ms = 0;
+    if ((key = reg_open_hkcu_key( "Software\\Wine\\Wayland Driver" )))
+    {
+        if (query_reg_ascii_value( key, "PaletteCommitDeferMs", info, sizeof(buffer) ) == sizeof(DWORD) &&
+            info->Type == REG_DWORD)
+            ms = *(DWORD *)info->Data;
+        NtClose( key );
+    }
+    return ms;
+}
+
+/* TRUE if this flush should be held back: a resizable caption-less popup (a tool
+ * palette) that still has invalid content and has been held for less than
+ * palette_commit_defer_ms. */
+static BOOL defer_popup_flush( struct window_surface *surface )
+{
+    static HWND defer_hwnd;
+    static DWORD defer_start;
+    int defer_ms = palette_commit_defer_ms();
+    DWORD style, now;
+    HRGN rgn;
+    UINT flags;
+
+    if (!defer_ms || surface == &dummy_surface) return FALSE;
+
+    style = get_window_long( surface->hwnd, GWL_STYLE );
+    if ((style & (WS_POPUP | WS_THICKFRAME)) != (WS_POPUP | WS_THICKFRAME) ||
+        (style & WS_CAPTION))
+        return FALSE;
+
+    if ((rgn = get_update_region( surface->hwnd, &flags, NULL )))
+    {
+        NtGdiDeleteObjectApp( rgn );
+        now = NtGetTickCount();
+        if (defer_hwnd != surface->hwnd)
+        {
+            defer_hwnd = surface->hwnd;
+            defer_start = now;
+            return TRUE;
+        }
+        if ((int)(now - defer_start) < defer_ms) return TRUE;
+    }
+    defer_hwnd = 0;
+    return FALSE;
+}
+
 void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -939,6 +1007,12 @@ void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
+
+    if (defer_popup_flush( surface ))
+    {
+        TRACE( "Holding the flush of hwnd %p, surface %p\n", surface->hwnd, surface );
+        return;
+    }
 
     window_surface_lock( surface );
 
