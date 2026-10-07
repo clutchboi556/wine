@@ -761,11 +761,21 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     if (!surface->shape_region) set_surface_shape_rect( shape_bits, shape_stride, dirty );
     else if ((data = GDI_GetObjPtr( surface->shape_region, NTGDI_OBJ_REGION )))
     {
-        if (EqualRect( rect, dirty )) memset( shape_bits, 0, shape_info->bmiHeader.biSizeImage );
+        /* A window whose mask is exactly its shape region (no colour key, no
+         * per-pixel alpha) derives the whole mask: the region can lose area as
+         * well as gain it, and a shape change now damages only the area whose
+         * masked state changed (see add_shape_damage), so clipping the region
+         * rects to it would leave the edges of the damage unset -- and
+         * set_surface_shape_rect only writes a rect in its unclipped form.  The
+         * mask is small (1bpp) so deriving all of it is cheap next to the colour
+         * copy the damage avoids. */
+        BOOL whole = !surface->alpha_mask && surface->color_key == CLR_INVALID;
+
+        if (whole || EqualRect( rect, dirty )) memset( shape_bits, 0, shape_info->bmiHeader.biSizeImage );
         for (shape_rect = data->rects; shape_rect < data->rects + data->numRects; shape_rect++)
         {
-            if (!intersect_rect( &tmp_rect, shape_rect, dirty )) continue;
-            set_surface_shape_rect( shape_bits, shape_stride, &tmp_rect );
+            if (!whole && !intersect_rect( &tmp_rect, shape_rect, dirty )) continue;
+            set_surface_shape_rect( shape_bits, shape_stride, whole ? shape_rect : &tmp_rect );
         }
         GDI_ReleaseObj( surface->shape_region );
     }
@@ -1102,21 +1112,74 @@ void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
     window_surface_unlock( surface );
 }
 
+/* Damage the pixels whose masked state changes when the window's shape goes from
+ * surface->shape_region to shape_region (either may be NULL).
+ *
+ * The driver applies the shape mask over the whole surface on every flush and
+ * zeroes the pixels outside the shape, so the pixels that can hold different
+ * contents afterwards are exactly those that are masked in one of the two
+ * states: the ones that become visible need their contents re-copied, and the
+ * ones that become hidden change in the buffer.  Damaging the whole surface
+ * instead (what this used to do) made every shape change re-derive the colour of
+ * the whole window, which for a resized tool palette -- whose per-step
+ * SetWindowRgn changes the shape, not the contents -- is the largest single flush
+ * of a step. */
+static void add_shape_damage( struct window_surface *surface, HRGN shape_region )
+{
+    RECT box;
+    HRGN changed;
+
+    if (!(changed = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return;
+
+    if (surface->shape_region && shape_region)
+        NtGdiCombineRgn( changed, surface->shape_region, shape_region, RGN_XOR );
+    else if (surface->shape_region || shape_region)
+    {
+        /* only one of the two states has a shape: everything the other one masked
+         * changes, either into visibility or into transparency */
+        NtGdiSetRectRgn( changed, surface->rect.left, surface->rect.top,
+                         surface->rect.right, surface->rect.bottom );
+        NtGdiCombineRgn( changed, changed, surface->shape_region ? surface->shape_region : shape_region, RGN_DIFF );
+    }
+
+    NtGdiGetRgnBox( changed, &box );
+    if (!IsRectEmpty( &box )) union_rect( &surface->bounds, &surface->bounds, &box );
+
+    NtGdiDeleteObjectApp( changed );
+}
+
 void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
 {
+    BOOL region_only_mask;
+
     window_surface_lock( surface );
+
+    /* A window whose mask is exactly its shape region changes the contents of only
+     * the pixels whose masked state changes when the region changes (see
+     * add_shape_damage).  A colour key or per-pixel alpha also feeds the mask, and
+     * those are derived from the colour bits, so such a window keeps re-deriving
+     * the colour of the whole surface. */
+    region_only_mask = !surface->alpha_mask && surface->color_key == CLR_INVALID;
 
     if (!shape_region && surface->shape_region)
     {
+        if (region_only_mask) add_shape_damage( surface, NULL );
+        else surface->bounds = surface->rect;
         NtGdiDeleteObjectApp( surface->shape_region );
         surface->shape_region = 0;
-        surface->bounds = surface->rect;
     }
     else if (shape_region && !NtGdiEqualRgn( shape_region, surface->shape_region ))
     {
-        if (!surface->shape_region) surface->shape_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+        if (!surface->shape_region)
+        {
+            /* the mask bitmap does not exist yet (or was never derived for the
+             * whole surface): derive it for everything */
+            surface->shape_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+            surface->bounds = surface->rect;
+        }
+        else if (region_only_mask) add_shape_damage( surface, shape_region );
+        else surface->bounds = surface->rect;
         NtGdiCombineRgn( surface->shape_region, shape_region, 0, RGN_COPY );
-        surface->bounds = surface->rect;
     }
 
     window_surface_unlock( surface );
