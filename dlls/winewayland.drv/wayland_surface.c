@@ -414,6 +414,27 @@ err:
 }
 
 /**********************************************************************
+ *          wayland_surface_unmap
+ *
+ * Detach the surface's buffer and commit, so the compositor stops showing it (a
+ * surface with no buffer is unmapped).  The role and the surface's state are left
+ * alone, so the next flush that attaches a buffer maps the window back.
+ *
+ * Used for a popup that another window of the application covers: Windows puts
+ * the covering window above it in the z-order and, when that window is activated,
+ * raises it, so the popup is not seen -- see wayland_unmap_covered_popups().
+ */
+void wayland_surface_unmap(struct wayland_surface *surface)
+{
+    TRACE("surface=%p\n", surface);
+
+    if (!surface->wl_surface) return;
+    wl_surface_attach(surface->wl_surface, NULL, 0, 0);
+    wl_surface_commit(surface->wl_surface);
+    wl_display_flush(process_wayland.wl_display);
+}
+
+/**********************************************************************
  *          wayland_surface_clear_role
  *
  * Clears the role related Wayland objects of a Wayland surface, making it a
@@ -509,6 +530,17 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
 
     TRACE("surface=%p shm_buffer=%p (%dx%d)\n",
           surface, shm_buffer, shm_buffer->width, shm_buffer->height);
+
+    /* A popup that another window of the application covers is not shown (see
+     * wayland_unmap_covered_popups): drop its contents, or this buffer would put
+     * it back over the window that covers it.  Nothing is marked busy, so the
+     * buffer goes straight back to the pool. */
+    if (surface->covered_popup)
+    {
+        TRACE("surface=%p is covered, dropping its contents\n", surface);
+        wayland_surface_unmap(surface);
+        return;
+    }
 
     shm_buffer->busy = TRUE;
     wayland_shm_buffer_ref(shm_buffer);

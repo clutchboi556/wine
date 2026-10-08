@@ -533,10 +533,24 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         }
     }
 
+    /* The application moved or resized this window: it wants it placed somewhere,
+     * so stop treating it as a popup that is merely covered (see
+     * wayland_unmap_covered_popups).  A window that is only repainted keeps the
+     * same rect and stays covered. */
+    if (data->wayland_surface &&
+        (data->rects.window.left != new_rects->window.left ||
+         data->rects.window.top != new_rects->window.top ||
+         data->rects.window.right != new_rects->window.right ||
+         data->rects.window.bottom != new_rects->window.bottom))
+    {
+        data->wayland_surface->covered_popup = FALSE;
+    }
+
     data->rects = *new_rects;
     data->is_fullscreen = fullscreen;
     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
     data->managed = managed;
+
 
     if (!surface)
     {
@@ -802,6 +816,76 @@ void wayland_restack_popups(HWND owner)
 }
 
 /**********************************************************************
+ *           wayland_unmap_covered_popups
+ *
+ * Windows does not show a popup that another window of the same application
+ * covers: the covering window is above it in the z-order, and activating a
+ * window raises it over anything it created earlier.  AutoCAD's splash screen
+ * relies on exactly that -- it is created *after* the main frame (so it starts
+ * above it) and activated while loading, which is the visible loading screen,
+ * and it is then neither hidden nor destroyed; on Windows the frame's activation
+ * when loading finishes raises the frame over it and the splash is not seen
+ * again.  Wayland has no raise request (the compositor stacks) and asking for
+ * activation without input would be focus stealing, so a covered popup keeps the
+ * stacking it got by being created last and floats over the application: the
+ * "stuck on loading" ghost over a running AutoCAD (2026-10-07).
+ *
+ * So when a window is activated, stop showing any visible, unowned, caption-less
+ * popup toplevel that it covers -- the same windows Windows would leave behind
+ * the activated one.  Only that shape is considered: an owned popup is drawn as
+ * part of its owner, and a captioned window is a window the user works with.  The
+ * popup comes back by itself if the application ever paints or shows it again.
+ */
+static void wayland_unmap_covered_popups(HWND activated)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    HWND hwnd, desktop;
+    RECT rect;
+
+    if (!(data = wayland_win_data_get(activated))) return;
+    surface = data->wayland_surface;
+    if (!surface || !surface->wl_surface || !wayland_surface_is_toplevel(surface) ||
+        !(surface->style & WS_VISIBLE))
+    {
+        wayland_win_data_release(data);
+        return;
+    }
+    rect = data->rects.window;
+    wayland_win_data_release(data);
+
+    /* walk the top-level windows from bottom-most to top-most; everything before
+     * the activated window is below it, and that is what it can cover. */
+    desktop = NtUserGetDesktopWindow();
+    hwnd = NtUserGetWindowRelative(desktop, GW_CHILD);
+    if (hwnd) hwnd = NtUserGetWindowRelative(hwnd, GW_HWNDLAST);
+    for (; hwnd; hwnd = NtUserGetWindowRelative(hwnd, GW_HWNDPREV))
+    {
+        struct wayland_win_data *other;
+        struct wayland_surface *other_surface;
+        RECT *r;
+
+        if (hwnd == activated) break;
+        if (!(other = wayland_win_data_get(hwnd))) continue;
+        other_surface = other->wayland_surface;
+        r = &other->rects.window;
+        if (other_surface && other_surface->wl_surface &&
+            wayland_surface_is_toplevel(other_surface) &&
+            (other_surface->style & WS_VISIBLE) &&
+            (other_surface->style & WS_POPUP) && !(other_surface->style & WS_CAPTION) &&
+            !NtUserGetWindowRelative(hwnd, GW_OWNER) &&
+            r->left >= rect.left && r->top >= rect.top &&
+            r->right <= rect.right && r->bottom <= rect.bottom)
+        {
+            TRACE("hwnd=%p is covered by activated hwnd=%p, unmapping it\n", hwnd, activated);
+            other_surface->covered_popup = TRUE;
+            wayland_surface_unmap(other_surface);
+        }
+        wayland_win_data_release(other);
+    }
+}
+
+/**********************************************************************
  *           WAYLAND_ActivateWindow
  *
  * Win32 activated a window: ask the compositor to give it keyboard focus.
@@ -853,6 +937,12 @@ void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
     HWND focused;
     uint32_t serial;
     BOOL ok;
+
+    /* Before anything else, and even when we cannot ask for focus (no input
+     * serial: this is how a launch finishes loading), stop showing a popup that
+     * the window being activated covers -- that is what Windows' z-order does
+     * for it. */
+    wayland_unmap_covered_popups(hwnd);
 
     if (!process_wayland.xdg_activation_v1) return;
 

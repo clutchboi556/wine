@@ -278,6 +278,20 @@ struct wayland_shm_buffer
 struct wayland_surface
 {
     HWND hwnd;
+    /* The window's style, cached where the driver already queries it
+     * (wayland_surface_create and WAYLAND_WindowPosChanged).  It is needed on the
+     * flush path, where calling NtUserGetWindowLongW would be a server round trip
+     * inside a win32u callback that may hold locks -- doing exactly that in
+     * wayland_surface_reconfigure_size deadlocked the application (2026-10-07). */
+    DWORD style;
+
+    /* Set while this surface's window is a popup that another window of the same
+     * application covers: its contents are dropped and the surface stays unmapped
+     * until the application moves the window (see wayland_unmap_covered_popups).
+     * Windows does not show such a popup either -- the covering window is above it
+     * in the z-order -- but a Wayland compositor has no way to be told that, so a
+     * fresh buffer would put the popup back over the window that covers it. */
+    BOOL covered_popup;
 
     struct wl_surface *wl_surface;
     struct wp_viewport *wp_viewport;
@@ -350,6 +364,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_clear_role(struct wayland_surface *surface);
+void wayland_surface_unmap(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
