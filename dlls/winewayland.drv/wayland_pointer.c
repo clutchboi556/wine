@@ -838,6 +838,26 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
 }
 
 /**********************************************************************
+ *          is_tool_palette_surface
+ *
+ * A tool palette is a caption-less resizable owned popup (a floating AutoCAD
+ * palette: Layer Properties, Properties, ...).  With
+ * WINEWAYLAND_FLOATING_PALETTES it is a toplevel the app moves and resizes with
+ * the pointer, so the pointer must be free to leave the small palette for the
+ * app to follow it.  AutoCAD also warps the pointer into the palette on activate
+ * (SetCursorPos) and sets a cursor clip during those drags; under Wayland those
+ * would pull the physical pointer to the palette's centre and confine it there.
+ * The style is read from the value cached on the surface -- querying the server
+ * here would be a round trip in a path that runs while the app is loading.
+ */
+static BOOL is_tool_palette_surface(const struct wayland_surface *surface)
+{
+    return surface &&
+           (surface->style & (WS_POPUP | WS_THICKFRAME)) == (WS_POPUP | WS_THICKFRAME) &&
+           !(surface->style & WS_CAPTION);
+}
+
+/**********************************************************************
  *          wayland_surface_calc_confine
  *
  * Calculates the pointer confine rect (in surface-local coords)
@@ -997,11 +1017,46 @@ void WAYLAND_SetCursor(HWND hwnd, HCURSOR hcursor)
 }
 
 /***********************************************************************
+ *           pointer_grab_disabled
+ *
+ * The physical pointer belongs to whoever is at the machine, so the driver
+ * leaves it alone unless it is asked not to: the application calls SetCursorPos
+ * freely (AutoCAD does while it drags a palette) and sets cursor clips while it
+ * resizes, which the driver implements with wp_pointer_warp_v1 and pointer
+ * constraints.  A constraint is sticky -- its only releaser is the app's own
+ * ClipCursor(NULL), which a modal window never sends -- so one warp or clip can
+ * take the mouse away for the life of the process, from whoever is using the
+ * machine (2026-10-15: a Plant 3D modal pinned the pointer through a whole game
+ * match; repro tests/cliplock.c).  Test runs need none of it: their input is
+ * injected through Windows, which reaches the application without the physical
+ * pointer (that is why headless and nested runs work).
+ *
+ * WINEWAYLAND_ALLOW_POINTER_GRAB=1 restores the upstream behaviour, for a
+ * session that is *about* the physical pointer (a palette-drag experiment).
+ */
+static BOOL pointer_grab_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0)
+    {
+        const char *env = getenv("WINEWAYLAND_ALLOW_POINTER_GRAB");
+        disabled = !(env && *env && *env != '0');
+    }
+    return disabled;
+}
+
+/***********************************************************************
  *           WAYLAND_SetCursorPos
  */
 BOOL WAYLAND_SetCursorPos(INT x, INT y)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
+
+    if (pointer_grab_disabled())
+    {
+        TRACE("not warping to %d,%d (WINEWAYLAND_ALLOW_POINTER_GRAB unset)\n", x, y);
+        return TRUE;
+    }
 
     pthread_mutex_lock(&pointer->mutex);
     if (pointer->relative_mode)
@@ -1029,8 +1084,17 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     struct wayland_win_data *data;
     RECT confine_rect;
     POINT cursor_pos, warp;
+    BOOL is_palette = FALSE;
 
     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
+
+    if (pointer_grab_disabled())
+    {
+        /* TESTING: do not confine the physical pointer (see pointer_grab_disabled) */
+        TRACE("not confining (WINEWAYLAND_ALLOW_POINTER_GRAB unset)\n");
+        wayland_pointer_update_constraint(NULL, NULL, TRUE);
+        return TRUE;
+    }
 
     NtUserGetCursorPos(&cursor_pos);
     hwnd = NtUserGetForegroundWindow();
@@ -1039,6 +1103,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     if ((surface = data->wayland_surface))
     {
         wl_surface = surface->wl_surface;
+        is_palette = is_tool_palette_surface(surface);
         if (clip) wayland_surface_calc_confine(surface, clip, &confine_rect);
         warp.x = cursor_pos.x - surface->window.rect.left;
         warp.y = cursor_pos.y - surface->window.rect.top;
@@ -1049,9 +1114,16 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     pthread_mutex_lock(&pointer->mutex);
     if (wl_surface && pointer->pending_warp)
     {
+        /* Never warp the pointer into a tool palette (see is_tool_palette_surface):
+         * AutoCAD SetCursorPos()es into the palette when it activates it, which
+         * would pull the physical pointer to its centre under Wayland. */
+        if (is_palette)
+        {
+            TRACE("not warping into palette hwnd=%p (%d,%d)\n", surface->hwnd, warp.x, warp.y);
+        }
         /* wp_pointer_warp_v1.warp_pointer needs a wl_pointer; a seat without
          * one (a headless compositor) would make libwayland abort the process. */
-        if (process_wayland.wp_pointer_warp_v1 && pointer->wl_pointer)
+        else if (process_wayland.wp_pointer_warp_v1 && pointer->wl_pointer)
         {
             wp_pointer_warp_v1_warp_pointer(
                     process_wayland.wp_pointer_warp_v1,
@@ -1088,9 +1160,10 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
 
    /* Since we are running in the context of the foreground thread we know
     * that the wl_surface of the foreground HWND will not be invalidated,
-    * so we can access it without having the win data lock. */
+    * so we can access it without having the win data lock.  A tool palette is
+    * never confined (see is_tool_palette_surface). */
     wayland_pointer_update_constraint(wl_surface,
-                                      (clip && wl_surface) ? &confine_rect : NULL,
+                                      (clip && wl_surface && !is_palette) ? &confine_rect : NULL,
                                       FALSE);
     pthread_mutex_unlock(&pointer->mutex);
 
