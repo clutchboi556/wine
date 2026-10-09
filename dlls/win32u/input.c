@@ -2060,7 +2060,8 @@ static HWND set_focus_window( HWND hwnd )
 
     if (previous)
     {
-        send_message( previous, WM_KILLFOCUS, (WPARAM)hwnd, 0 );
+        send_message_timeout( previous, WM_KILLFOCUS, (WPARAM)hwnd, 0,
+                              SMTO_ABORTIFHUNG, 2000, FALSE );
 
         ime_hwnd = get_default_ime_window( previous );
         if (ime_hwnd)
@@ -2078,7 +2079,11 @@ static HWND set_focus_window( HWND hwnd )
 
         NtUserNotifyWinEvent( EVENT_OBJECT_FOCUS, hwnd, OBJID_CLIENT, 0 );
 
-        send_message( hwnd, WM_SETFOCUS, (WPARAM)previous, 0 );
+        /* Abort if the target thread does not pump: AutoCAD's Start tab and
+         * its WebView2 helper windows live on threads that never read their
+         * queue, and a synchronous send here froze the whole UI. */
+        send_message_timeout( hwnd, WM_SETFOCUS, (WPARAM)previous, 0,
+                              SMTO_ABORTIFHUNG, 2000, FALSE );
     }
     return previous;
 }
