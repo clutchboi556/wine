@@ -5214,7 +5214,18 @@ BOOL WINAPI NtUserShowWindow( HWND hwnd, INT cmd )
     if ((cmd == SW_SHOW) && (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
         return TRUE;
 
-    return send_message( hwnd, WM_WINE_SHOWWINDOW, cmd, 0 );
+    /* Notify, don't wait: a synchronous send here blocks the caller forever
+     * when the target window's thread does not pump messages.  AutoCAD's Start
+     * tab calls ShowWindow on a WebView2 helper window owned by a thread that
+     * never pumps, which froze the whole UI.  The message is informational --
+     * the target thread shows the window itself -- and the return value is the
+     * window's previous visibility, so read it directly. */
+    {
+        BOOL was_visible = (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE) != 0;
+        NtUserMessageCall( hwnd, WM_WINE_SHOWWINDOW, cmd, 0, 0,
+                           NtUserSendNotifyMessage, FALSE );
+        return was_visible;
+    }
 }
 
 /***********************************************************************
