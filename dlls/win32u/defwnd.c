@@ -2984,8 +2984,13 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
 
             if (!win_array)
                 break;
+            /* Notify, don't wait: a synchronous send to every child blocks the
+             * caller forever when one child lives on a thread that never pumps
+             * messages (AutoCAD's WebView2 helper windows).  The message is
+             * informational, like the WM_PALETTEISCHANGING broadcast. */
             while (win_array[count])
-                send_message( win_array[count++], WM_INPUTLANGCHANGE, wparam, lparam );
+                NtUserMessageCall( win_array[count++], WM_INPUTLANGCHANGE, wparam, lparam,
+                                   0, NtUserSendNotifyMessage, FALSE );
             free( win_array );
             break;
         }
