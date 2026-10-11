@@ -36,6 +36,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+WINE_DECLARE_DEBUG_CHANNEL(handoff);
 
 /* The cursor-shape-v1 protocol file references the zwp_tablet_tool_v2
  * interface object. Since we don't currently use the tablet protocol,
@@ -195,6 +196,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     hwnd = wl_surface_get_user_data(wl_surface);
 
     TRACE("hwnd=%p\n", hwnd);
+    TRACE_(handoff)("enter hwnd=%p serial=%u\n", hwnd, serial);
 
     pthread_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = hwnd;
@@ -261,6 +263,9 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     }
 
     if (state == WL_POINTER_BUTTON_STATE_RELEASED) input.mi.dwFlags <<= 1;
+
+    TRACE_(handoff)("button hwnd=%p button=%u state=%u serial=%u\n",
+                    hwnd, button, state, serial);
 
     pthread_mutex_lock(&pointer->mutex);
     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
@@ -909,8 +914,15 @@ static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
     needs_lock = wl_surface &&
                  ((confine_rect && !is_visible) || force_lock) &&
                  pointer->wl_pointer;
-    needs_confine = wl_surface && confine_rect && is_visible && !force_lock &&
-                    pointer->wl_pointer;
+    /* A cursor clip (ClipCursor) is screen-space, but a Wayland compositor can
+     * only confine the pointer to a *surface*.  Confining to the foreground
+     * window's surface is therefore wrong whenever the clip does not match the
+     * foreground: AutoCAD clips the cursor to the palette it is resizing while
+     * the foreground is still the main frame, and the compositor then warps the
+     * cursor back into that surface ("the mouse yanked to the centre").  The
+     * clip is rarely needed, so never confine; the pointer *lock* (relative
+     * motion for games) above is unchanged. */
+    needs_confine = FALSE;
 
     if (!needs_confine && pointer->zwp_confined_pointer_v1)
     {
@@ -1068,6 +1080,7 @@ BOOL WAYLAND_SetCursorPos(INT x, INT y)
     pthread_mutex_unlock(&pointer->mutex);
 
     TRACE("warping to %d,%d\n", x, y);
+    TRACE_(handoff)("SetCursorPos %d,%d\n", x, y);
     reapply_cursor_clipping();
     return TRUE;
 }
@@ -1104,6 +1117,8 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     {
         wl_surface = surface->wl_surface;
         is_palette = is_tool_palette_surface(surface);
+        TRACE_(handoff)("ClipCursor fg=%p surface=%p is_palette=%d pending_warp=%d\n",
+                        hwnd, surface->hwnd, is_palette, pointer->pending_warp);
         if (clip) wayland_surface_calc_confine(surface, clip, &confine_rect);
         warp.x = cursor_pos.x - surface->window.rect.left;
         warp.y = cursor_pos.y - surface->window.rect.top;
