@@ -8,15 +8,15 @@
 @ stub WinUsb_GetOverlappedResult
 @ stub WinUsb_GetPipePolicy
 @ stub WinUsb_GetPowerPolicy
-@ stub WinUsb_Initialize
+@ stdcall WinUsb_Initialize(long ptr)
 @ stub WinUsb_ParseConfigurationDescriptor
 @ stub WinUsb_ParseDescriptors
-@ stub WinUsb_QueryDeviceInformation
-@ stub WinUsb_QueryInterfaceSettings
-@ stub WinUsb_QueryPipe
+@ stdcall WinUsb_QueryDeviceInformation(ptr long ptr ptr)
+@ stdcall WinUsb_QueryInterfaceSettings(ptr long ptr)
+@ stdcall WinUsb_QueryPipe(ptr long long ptr)
 @ stub WinUsb_ReadPipe
 @ stub WinUsb_ResetPipe
 @ stub WinUsb_SetCurrentAlternateSetting
 @ stub WinUsb_SetPipePolicy
 @ stub WinUsb_SetPowerPolicy
-@ stub WinUsb_WritePipe
+@ stdcall WinUsb_WritePipe(ptr long ptr long ptr ptr)

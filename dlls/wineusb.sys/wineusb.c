@@ -28,6 +28,7 @@
 #include "windef.h"
 #include "winioctl.h"
 #include "winternl.h"
+#include "initguid.h"
 #include "ddk/wdm.h"
 #include "ddk/usb.h"
 #include "ddk/usbioctl.h"
@@ -83,7 +84,28 @@ struct usb_device
 
     struct unix_device *unix_device;
 
+    UNICODE_STRING winusb_link;
+
     LIST_ENTRY irp_list;
+};
+
+/* Private interface to winusb.dll: buffered requests on the device itself,
+ * since there is no winusb.sys function driver to sit on top of it. */
+DEFINE_GUID(GUID_DEVINTERFACE_USB_DEVICE, 0xa5dcbf10, 0x6530, 0x11d2, 0x90, 0x1f, 0x00, 0xc0, 0x4f, 0xb9, 0x51, 0xed);
+
+#define IOCTL_WINEUSB_GET_INFO       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINEUSB_GET_DESCRIPTOR CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WINEUSB_WRITE_PIPE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+struct wineusb_info
+{
+    LONG interface_index;   /* -1 for a whole device */
+};
+
+struct wineusb_get_descriptor
+{
+    UCHAR type, index;
+    USHORT langid;
 };
 
 static DRIVER_OBJECT *driver_obj;
@@ -173,13 +195,40 @@ static void remove_unix_device(struct unix_device *unix_device)
 
 static HANDLE event_thread;
 
+/* Finish a request that driver_ioctl() turned into an URB. */
+static NTSTATUS finish_user_urb(IRP *irp)
+{
+    URB *urb = irp->Tail.Overlay.DriverContext[2];
+    ULONG code = (ULONG_PTR)irp->Tail.Overlay.DriverContext[3];
+    NTSTATUS status = STATUS_SUCCESS;
+
+    irp->Tail.Overlay.DriverContext[2] = NULL;
+    irp->IoStatus.Information = 0;
+
+    if (!USBD_SUCCESS(urb->UrbHeader.Status))
+        status = STATUS_UNSUCCESSFUL;
+    else if (code == IOCTL_WINEUSB_GET_DESCRIPTOR)
+        irp->IoStatus.Information = urb->UrbControlDescriptorRequest.TransferBufferLength;
+    else if (code == IOCTL_WINEUSB_WRITE_PIPE)
+    {
+        *(ULONG *)irp->AssociatedIrp.SystemBuffer = urb->UrbBulkOrInterruptTransfer.TransferBufferLength;
+        irp->IoStatus.Information = sizeof(ULONG);
+    }
+
+    free(urb);
+    return status;
+}
+
 static void complete_irp(IRP *irp)
 {
     EnterCriticalSection(&wineusb_cs);
     RemoveEntryList(&irp->Tail.Overlay.ListEntry);
     LeaveCriticalSection(&wineusb_cs);
 
-    irp->IoStatus.Status = STATUS_SUCCESS;
+    if (irp->Tail.Overlay.DriverContext[2])
+        irp->IoStatus.Status = finish_user_urb(irp);
+    else
+        irp->IoStatus.Status = STATUS_SUCCESS;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
 }
 
@@ -480,10 +529,28 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
         }
 
         case IRP_MN_START_DEVICE:
+            if (!device->winusb_link.Buffer)
+            {
+                /* Software written for WinUSB finds the device by the GUID
+                 * the device asks for; everything else gets the generic one. */
+                struct usb_get_winusb_guid_params params =
+                {
+                    .device = device->unix_device,
+                    .interface_index = device->interface_index,
+                };
+                GUID guid = GUID_DEVINTERFACE_USB_DEVICE;
+
+                params.guid = &guid;
+                WINE_UNIX_CALL(unix_usb_get_winusb_guid, &params);
+                if (!IoRegisterDeviceInterface(device_obj, &guid, NULL, &device->winusb_link))
+                    IoSetDeviceInterfaceState(&device->winusb_link, TRUE);
+            }
             ret = STATUS_SUCCESS;
             break;
 
         case IRP_MN_SURPRISE_REMOVAL:
+            if (device->winusb_link.Buffer)
+                IoSetDeviceInterfaceState(&device->winusb_link, FALSE);
             EnterCriticalSection(&wineusb_cs);
             remove_pending_irps(device);
             if (!device->removed)
@@ -501,6 +568,7 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 
             destroy_unix_device(device->unix_device);
 
+            RtlFreeUnicodeString(&device->winusb_link);
             IoDeleteDevice(device->device_obj);
             ret = STATUS_SUCCESS;
             break;
@@ -670,6 +738,143 @@ static NTSTATUS WINAPI driver_internal_ioctl(DEVICE_OBJECT *device_obj, IRP *irp
     return status;
 }
 
+static NTSTATUS WINAPI driver_create_close(DEVICE_OBJECT *device_obj, IRP *irp)
+{
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+/* Requests from winusb.dll. The buffers are the I/O manager's copies, so an
+ * URB pointing into them can go down the same path as a client driver's. */
+static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+    ULONG in_size = stack->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG out_size = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    struct usb_device *device = device_obj->DeviceExtension;
+    BYTE *buffer = irp->AssociatedIrp.SystemBuffer;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    URB *urb = NULL;
+    BOOL removed;
+
+    TRACE("device_obj %p, irp %p, code %#lx, in_size %lu, out_size %lu.\n", device_obj, irp, code, in_size, out_size);
+
+    irp->IoStatus.Information = 0;
+
+    if (device_obj == bus_fdo)
+        goto done;
+
+    EnterCriticalSection(&wineusb_cs);
+    removed = device->removed;
+    LeaveCriticalSection(&wineusb_cs);
+    if (removed)
+    {
+        status = STATUS_DELETE_PENDING;
+        goto done;
+    }
+
+    switch (code)
+    {
+        case IOCTL_WINEUSB_GET_INFO:
+        {
+            struct wineusb_info *info = (struct wineusb_info *)buffer;
+
+            if (out_size < sizeof(*info))
+            {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+            info->interface_index = device->interface ? device->interface_index : -1;
+            irp->IoStatus.Information = sizeof(*info);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        case IOCTL_WINEUSB_GET_DESCRIPTOR:
+        {
+            struct wineusb_get_descriptor params;
+
+            if (in_size < sizeof(params) || !out_size)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            params = *(struct wineusb_get_descriptor *)buffer;
+
+            if (!(urb = calloc(1, sizeof(*urb))))
+            {
+                status = STATUS_NO_MEMORY;
+                break;
+            }
+            urb->UrbHeader.Function = URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE;
+            urb->UrbHeader.Length = sizeof(urb->UrbControlDescriptorRequest);
+            urb->UrbControlDescriptorRequest.DescriptorType = params.type;
+            urb->UrbControlDescriptorRequest.Index = params.index;
+            urb->UrbControlDescriptorRequest.LanguageId = params.langid;
+            urb->UrbControlDescriptorRequest.TransferBuffer = buffer;
+            urb->UrbControlDescriptorRequest.TransferBufferLength = out_size;
+            break;
+        }
+
+        case IOCTL_WINEUSB_WRITE_PIPE:
+        {
+            union
+            {
+                struct { unsigned char endpoint, type; } pipe;
+                HANDLE handle;
+            } u = {{0}};
+
+            if (in_size < sizeof(ULONG) || out_size < sizeof(ULONG))
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            u.pipe.endpoint = *(ULONG *)buffer;
+            u.pipe.type = UsbdPipeTypeBulk;
+
+            if (!(urb = calloc(1, sizeof(*urb))))
+            {
+                status = STATUS_NO_MEMORY;
+                break;
+            }
+            urb->UrbHeader.Function = URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER;
+            urb->UrbHeader.Length = sizeof(urb->UrbBulkOrInterruptTransfer);
+            urb->UrbBulkOrInterruptTransfer.PipeHandle = u.handle;
+            urb->UrbBulkOrInterruptTransfer.TransferFlags = USBD_TRANSFER_DIRECTION_OUT;
+            urb->UrbBulkOrInterruptTransfer.TransferBuffer = buffer + sizeof(ULONG);
+            urb->UrbBulkOrInterruptTransfer.TransferBufferLength = in_size - sizeof(ULONG);
+            break;
+        }
+
+        default:
+            FIXME("Unhandled ioctl %#lx.\n", code);
+    }
+
+    if (urb)
+    {
+        irp->Tail.Overlay.DriverContext[2] = urb;
+        irp->Tail.Overlay.DriverContext[3] = (void *)(ULONG_PTR)code;
+        stack->Parameters.Others.Argument1 = urb;
+        status = usb_submit_urb(device, irp);
+        if (status == STATUS_PENDING)
+            return status;
+        if (status == STATUS_SUCCESS)
+            status = finish_user_urb(irp);
+        else
+        {
+            irp->Tail.Overlay.DriverContext[2] = NULL;
+            free(urb);
+        }
+    }
+
+done:
+    irp->IoStatus.Status = status;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return status;
+}
+
 static NTSTATUS WINAPI driver_add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *pdo)
 {
     NTSTATUS ret;
@@ -711,6 +916,9 @@ NTSTATUS WINAPI DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *path)
     driver->DriverUnload = driver_unload;
     driver->MajorFunction[IRP_MJ_PNP] = driver_pnp;
     driver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = driver_internal_ioctl;
+    driver->MajorFunction[IRP_MJ_CREATE] = driver_create_close;
+    driver->MajorFunction[IRP_MJ_CLOSE] = driver_create_close;
+    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = driver_ioctl;
 
     return STATUS_SUCCESS;
 }
