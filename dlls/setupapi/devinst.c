@@ -3108,6 +3108,21 @@ BOOL WINAPI SetupDiGetDeviceRegistryPropertyW(HDEVINFO devinfo,
         return TRUE;
     }
 
+    if (Property == SPDRP_INSTALL_STATE)
+    {
+        /* Every device Wine enumerates has its driver; applications check
+         * this before opening a device (3Dconnexion's broker service). */
+        if (PropertyRegDataType) *PropertyRegDataType = REG_DWORD;
+        if (RequiredSize) *RequiredSize = sizeof(DWORD);
+        if (!PropertyBuffer || PropertyBufferSize < sizeof(DWORD))
+        {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        *(DWORD *)PropertyBuffer = 0; /* CM_INSTALL_STATE_INSTALLED */
+        return TRUE;
+    }
+
     if (Property < ARRAY_SIZE(PropertyMap) && PropertyMap[Property].nameW)
     {
         DWORD size = PropertyBufferSize;
@@ -4378,6 +4393,32 @@ BOOL WINAPI SetupDiGetDevicePropertyW(HDEVINFO devinfo, PSP_DEVINFO_DATA device_
 
     if (!(device = get_device(devinfo, device_data)))
         return FALSE;
+
+    if (prop_key && prop_key->pid == 24 /* DEVPKEY_Device_EnumeratorName */
+        && IsEqualGUID(&prop_key->fmtid, &DEVPKEY_Device_DeviceDesc.fmtid))
+    {
+        /* Not stored in the registry: it is the first component of the instance ID. */
+        const WCHAR *backslash = wcschr(device->instanceId, '\\');
+        DWORD len = backslash ? backslash - device->instanceId : wcslen(device->instanceId);
+        DWORD size = (len + 1) * sizeof(WCHAR);
+
+        if (prop_buff_size && !prop_buff)
+        {
+            SetLastError(ERROR_INVALID_USER_BUFFER);
+            return FALSE;
+        }
+        if (prop_type) *prop_type = DEVPROP_TYPE_STRING;
+        if (required_size) *required_size = size;
+        if (prop_buff_size < size)
+        {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        memcpy(prop_buff, device->instanceId, len * sizeof(WCHAR));
+        ((WCHAR *)prop_buff)[len] = 0;
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
 
     ls = get_device_property(device, devinfo, device_data, prop_key, prop_type, prop_buff, prop_buff_size,
                              required_size, flags);
