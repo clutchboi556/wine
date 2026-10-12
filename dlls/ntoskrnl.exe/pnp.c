@@ -507,6 +507,33 @@ static INT32 cm_devcaps_from_device_capabalities(DEVICE_CAPABILITIES *caps)
     return ret_val;
 }
 
+/* HACK: an interface of a composite USB device is a child of the device on
+ * Windows (usbccgp creates it), and software relies on that to tell which
+ * interfaces belong to the same physical device: the 3Dconnexion driver only
+ * uses a WinUSB interface whose parent is the grandparent of its HID device.
+ * Here the interfaces come straight from the bus drivers -- and from two of
+ * them, since winebus creates the HID one from hidraw and wineusb the rest --
+ * so point them all at wineusb's node for the whole device. */
+static void get_usb_composite_parent( const WCHAR *instance_id, WCHAR *parent_id )
+{
+    WCHAR key_name[MAX_DEVICE_ID_LEN + 40], device_id[MAX_DEVICE_ID_LEN], instance[MAX_DEVICE_ID_LEN];
+    const WCHAR *mi, *end;
+    DWORD size = ARRAY_SIZE(instance);
+    HKEY key;
+
+    if (wcsnicmp( instance_id, L"USB\\VID_", 8 )) return;
+    if (!(end = wcschr( instance_id + 4, '\\' ))) return;
+    if (!(mi = wcsstr( instance_id, L"&MI_" )) || mi > end) return;
+
+    lstrcpynW( device_id, instance_id, mi - instance_id + 1 );
+    swprintf( key_name, ARRAY_SIZE(key_name), L"System\\CurrentControlSet\\Enum\\%s", device_id );
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, key_name, 0, KEY_READ, &key )) return;
+    /* FIXME: with two identical devices this picks the same one for both. */
+    if (!RegEnumKeyExW( key, 0, instance, &size, NULL, NULL, NULL, NULL ))
+        swprintf( parent_id, MAX_DEVICE_ID_LEN, L"%s\\%s", device_id, instance );
+    RegCloseKey( key );
+}
+
 static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OBJECT *parent_device )
 {
     static const WCHAR infpathW[] = {'I','n','f','P','a','t','h',0};
@@ -643,8 +670,11 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
     }
 
     if (!get_device_instance_id( parent_device, parent_id ))
+    {
+        get_usb_composite_parent( device_instance_id, parent_id );
         SetupDiSetDevicePropertyW( set, &sp_device, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
                 (BYTE *)parent_id, (wcslen( parent_id ) + 1) * sizeof(WCHAR), 0 );
+    }
 
     if (need_driver && !install_device_driver( device, set, &sp_device ) && !caps.RawDeviceOK)
     {
