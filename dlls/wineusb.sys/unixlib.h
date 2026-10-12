@@ -74,6 +74,13 @@ struct usb_destroy_device_params
     struct unix_device *device;
 };
 
+struct usb_get_winusb_guid_params
+{
+    struct unix_device *device;
+    INT16 interface_index;
+    GUID *guid;
+};
+
 enum unix_funcs
 {
     unix_usb_main_loop,
@@ -82,6 +89,7 @@ enum unix_funcs
     unix_usb_submit_urb,
     unix_usb_cancel_transfer,
     unix_usb_destroy_device,
+    unix_usb_get_winusb_guid,
 };
 
 #endif

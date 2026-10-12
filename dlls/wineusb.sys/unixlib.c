@@ -24,7 +24,9 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <libusb.h>
 #include <pthread.h>
 #include "ntstatus.h"
@@ -642,6 +644,86 @@ static NTSTATUS usb_destroy_device(void *args)
     return STATUS_SUCCESS;
 }
 
+/* Microsoft OS 1.0 descriptors: a device that wants WinUSB without an INF says
+ * so itself, and names the device interface GUID its software looks for. */
+static NTSTATUS usb_get_winusb_guid(void *args)
+{
+    const struct usb_get_winusb_guid_params *params = args;
+    libusb_device_handle *handle = params->device->handle;
+    unsigned int d1, d2, d3, d4[8], count, i;
+    unsigned char buffer[1024], vendor;
+    int size, pos;
+
+    /* string descriptor 0xee is "MSFT100" followed by the vendor request code */
+    size = libusb_control_transfer(handle, LIBUSB_ENDPOINT_IN, LIBUSB_REQUEST_GET_DESCRIPTOR,
+            (LIBUSB_DT_STRING << 8) | 0xee, 0, buffer, 18, 200);
+    if (size < 18 || memcmp(buffer + 2, "M\0S\0F\0T\0001\0000\0000\0", 14))
+        return STATUS_NOT_FOUND;
+    vendor = buffer[16];
+
+    /* compatible ID feature descriptor: one 24-byte section per function,
+     * and only the ones marked WINUSB are meant to be opened this way */
+    size = libusb_control_transfer(handle,
+            LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+            vendor, 0, 4, buffer, sizeof(buffer), 200);
+    if (size < 16)
+        return STATUS_NOT_FOUND;
+    count = buffer[8];
+    for (i = 0, pos = 16; i < count && pos + 24 <= size; ++i, pos += 24)
+    {
+        if (buffer[pos] == params->interface_index && !memcmp(buffer + pos + 2, "WINUSB", 6))
+            break;
+    }
+    if (i == count || pos + 24 > size)
+        return STATUS_NOT_FOUND;
+
+    /* extended properties feature descriptor of the interface */
+    size = libusb_control_transfer(handle,
+            LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE,
+            vendor, params->interface_index < 0 ? 0 : params->interface_index, 5, buffer, sizeof(buffer), 200);
+    if (size < 10)
+        return STATUS_NOT_FOUND;
+
+    count = buffer[8] | (buffer[9] << 8);
+    pos = 10;
+    while (count-- && pos + 14 <= size)
+    {
+        unsigned int prop_size = buffer[pos] | (buffer[pos + 1] << 8) | (buffer[pos + 2] << 16) | ((unsigned int)buffer[pos + 3] << 24);
+        unsigned int name_len = buffer[pos + 8] | (buffer[pos + 9] << 8);
+        const unsigned char *name = buffer + pos + 10, *data;
+        char name_a[64], data_a[64];
+        unsigned int data_len;
+
+        if (prop_size < 14 || pos + prop_size > size || 14 + name_len > prop_size)
+            break;
+        data_len = name[name_len] | (name[name_len + 1] << 8);
+        data = name + name_len + 4;
+        if (14 + name_len + data_len > prop_size)
+            break;
+
+        /* both are UTF-16 strings of plain ASCII */
+        for (i = 0; i < name_len / 2 && i < sizeof(name_a) - 1; ++i) name_a[i] = name[i * 2];
+        name_a[i] = 0;
+        for (i = 0; i < data_len / 2 && i < sizeof(data_a) - 1; ++i) data_a[i] = data[i * 2];
+        data_a[i] = 0;
+
+        if ((!strcmp(name_a, "DeviceInterfaceGUID") || !strcmp(name_a, "DeviceInterfaceGUIDs"))
+                && sscanf(data_a, "{%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x}", &d1, &d2, &d3,
+                          &d4[0], &d4[1], &d4[2], &d4[3], &d4[4], &d4[5], &d4[6], &d4[7]) == 11)
+        {
+            params->guid->Data1 = d1;
+            params->guid->Data2 = d2;
+            params->guid->Data3 = d3;
+            for (i = 0; i < 8; ++i) params->guid->Data4[i] = d4[i];
+            TRACE("Interface %d wants WinUSB with interface GUID %s.\n", params->interface_index, data_a);
+            return STATUS_SUCCESS;
+        }
+        pos += prop_size;
+    }
+
+    return STATUS_NOT_FOUND;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
 #define X(name) [unix_ ## name] = name
@@ -651,4 +733,5 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     X(usb_submit_urb),
     X(usb_cancel_transfer),
     X(usb_destroy_device),
+    X(usb_get_winusb_guid),
 };
