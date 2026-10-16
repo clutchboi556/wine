@@ -555,17 +555,28 @@ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
 
     if (!hcursor) goto clear_cursor;
 
+    if (!get_icon_info(hcursor, &info))
+    {
+        /* HICON/HCURSOR handles are per-process in Wine, so a cursor created by
+         * another process (AutoCAD's sizing/border cursors -- Windows handles
+         * are session-global, so it works there) cannot be resolved here.  Keep
+         * the current cursor instead of clearing it, and warn once per handle:
+         * the app re-sets the same cursor on every pointer motion, which
+         * otherwise floods the log. */
+        static HICON warned;
+        if (hcursor != warned)
+        {
+            WARN("cannot resolve cursor %p (handle from another process?); keeping the current one\n", hcursor);
+            warned = hcursor;
+        }
+        return;
+    }
+
     /* Create a new buffer for the specified cursor. */
     if (cursor->shm_buffer)
     {
         wayland_shm_buffer_unref(cursor->shm_buffer);
         cursor->shm_buffer = NULL;
-    }
-
-    if (!get_icon_info(hcursor, &info))
-    {
-        ERR("Failed to get icon info for cursor=%p\n", hcursor);
-        goto clear_cursor;
     }
 
     if (info.hbmColor)
