@@ -31,7 +31,11 @@
 
 #include "ntuser.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -204,6 +208,66 @@ static void wayland_add_device_source(const struct gdi_device_manager *device_ma
     device_manager->add_source(output_info->output->name, state_flags, dpi, param);
 }
 
+/* The wl_output name is the DRM connector name ("DP-1"), and the kernel exposes
+ * the connector's raw EDID at /sys/class/drm/<card>-<connector>/edid.  win32u
+ * derives the monitor's PnP id, its friendly name and its preferred mode from
+ * those bytes, and applications read the same values back out of the
+ * Enum\DISPLAY registry keys, so a driver that reports none leaves every
+ * monitor as a nameless "Generic Non-PnP Monitor" with no preferred mode.
+ *
+ * On success fills *edid with a heap buffer that the caller owns and returns
+ * its length; returns 0 and leaves *edid alone if no EDID could be read. */
+static unsigned int get_output_edid( const char *name, unsigned char **edid )
+{
+    unsigned char buffer[4096];
+    unsigned int len = 0;
+    struct dirent *entry;
+    size_t name_len;
+    DIR *dir;
+    int fd;
+
+    if (!(dir = opendir( "/sys/class/drm" )))
+    {
+        WARN( "Failed to open /sys/class/drm, errno %d.\n", errno );
+        return 0;
+    }
+
+    name_len = strlen( name );
+    while ((entry = readdir( dir )))
+    {
+        size_t entry_len = strlen( entry->d_name );
+        char path[sizeof("/sys/class/drm//edid") + 256];
+        ssize_t count;
+
+        /* Connector entries are named "<card>-<connector>"; accept only an
+         * exact connector name, so that "DP-1" does not match "DP-11". */
+        if (entry_len <= name_len + 1 || entry->d_name[entry_len - name_len - 1] != '-' ||
+            strcmp( entry->d_name + entry_len - name_len, name ))
+            continue;
+
+        snprintf( path, sizeof(path), "/sys/class/drm/%s/edid", entry->d_name );
+        if ((fd = open( path, O_RDONLY | O_CLOEXEC )) == -1) continue;
+
+        /* sysfs attributes always report a size of zero, so read until EOF. */
+        while (len < sizeof(buffer) &&
+               (count = read( fd, buffer + len, sizeof(buffer) - len )) > 0)
+            len += count;
+        close( fd );
+
+        /* An EDID is a whole number of 128-byte blocks; anything else is a
+         * connector whose monitor did not answer a DDC transaction. */
+        if (len >= 128 && !(len % 128) && (*edid = malloc( len )))
+        {
+            memcpy( *edid, buffer, len );
+            break;
+        }
+        len = 0;
+    }
+
+    closedir( dir );
+    return len;
+}
+
 static void wayland_add_device_monitor(const struct gdi_device_manager *device_manager,
                                        void *param, struct output_info *output_info,
                                        struct output_info *primary)
@@ -218,10 +282,14 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
     /* We don't have a direct way to get the work area in Wayland. */
     monitor.rc_work = monitor.rc_monitor;
 
-    TRACE("name=%s rc_monitor=rc_work=%s\n",
-          output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor));
+    monitor.edid_len = get_output_edid( output_info->output->name, &monitor.edid );
+
+    TRACE("name=%s rc_monitor=rc_work=%s edid_len=%u\n",
+          output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor), monitor.edid_len);
 
     device_manager->add_monitor(&monitor, param);
+
+    free( monitor.edid );
 }
 
 static void populate_devmode(struct wayland_output_mode *output_mode, DEVMODEW *mode)
