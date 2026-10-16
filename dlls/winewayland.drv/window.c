@@ -37,6 +37,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+WINE_DECLARE_DEBUG_CHANNEL(handoff);
 
 
 static int wayland_win_data_cmp_rb(const void *key,
@@ -396,6 +397,21 @@ static BOOL floating_palettes_enabled(void)
     return enabled;
 }
 
+/* EXPERIMENT (WINEWAYLAND_HIDE_UNMAP=1): re-evaluate a window's wayland role when
+ * its WS_VISIBLE changes, so a window the application hides (rather than destroys)
+ * is unmapped instead of leaving a frozen frame on screen (see
+ * WAYLAND_WindowPosChanged). */
+static BOOL hide_unmap_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv("WINEWAYLAND_HIDE_UNMAP");
+        enabled = env && *env && *env != '0';
+    }
+    return enabled;
+}
+
 /* Phase B of the floating-palette work: hand the app's own move/resize of such
  * a toplevel to the compositor (xdg_toplevel_move/resize).  Kept separate from
  * floating_palettes_enabled so the toplevel change can be tested without it
@@ -511,6 +527,23 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     TRACE("hwnd %p style %#x owner %p managed %d surface owner %p\n", hwnd, (UINT)style, win_owner, managed, owner);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
+    if (data->wayland_surface)
+    {
+        BOOL was_visible = (data->wayland_surface->style & WS_VISIBLE) == WS_VISIBLE;
+        BOOL now_visible = (style & WS_VISIBLE) == WS_VISIBLE;
+
+        data->wayland_surface->style = style;
+        /* EXPERIMENT (WINEWAYLAND_HIDE_UNMAP=1): the wayland role follows
+         * WS_VISIBLE (wayland_win_data_update_wayland_state picks
+         * WAYLAND_SURFACE_ROLE_NONE for a hidden window, which clears the role and
+         * unpaints the surface), but that state was only recomputed when the
+         * surface was *created* -- so a window the application *hides* rather than
+         * destroys kept its role and its last buffer, and the compositor kept
+         * showing it: AutoCAD's loading screen stayed on screen as a frozen ghost
+         * over a running application, which reads as a stuck load (2026-10-07). */
+        if (hide_unmap_enabled() && was_visible != now_visible)
+            wayland_win_data_update_wayland_state(data);
+    }
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
 
@@ -526,25 +559,36 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
                      (o->right - o->left == n->right - n->left) && (o->bottom - o->top == n->bottom - n->top);
         BOOL resized = (o->right - o->left != n->right - n->left) || (o->bottom - o->top != n->bottom - n->top);
         BOOL held;
+        uint32_t button_serial;
+        HWND focused;
 
         pthread_mutex_lock(&process_wayland.pointer.mutex);
-        held = process_wayland.pointer.button_serial && process_wayland.pointer.focused_hwnd == hwnd;
+        button_serial = process_wayland.pointer.button_serial;
+        focused = process_wayland.pointer.focused_hwnd;
         pthread_mutex_unlock(&process_wayland.pointer.mutex);
 
-        if (held && (moved || resized) && !(swp_flags & SWP_NOSENDCHANGING))
+        /* The pointer is normally over a child subsurface of the toplevel while
+         * the user drags a palette's title strip (AutoCAD's AfxControlBar140u),
+         * not over the toplevel itself, so accept any window whose root ancestor
+         * is the toplevel being moved. */
+        held = button_serial && focused &&
+               (focused == hwnd || NtUserGetAncestor(focused, GA_ROOT) == hwnd);
+
+        /* Diagnostic: which side of the hand-off condition fails during a drag. */
+        if (moved || resized)
+            TRACE_(handoff)("hwnd %p: moved=%d resized=%d button_serial=%u focused=%p held=%d flags=%x\n",
+                            hwnd, moved, resized, button_serial, focused, held, swp_flags);
+
+        /* Hand only a *move* to the compositor (xdg_toplevel_move): a Wayland
+         * toplevel cannot position itself, so the app's SetWindowPos for a move
+         * cannot be honoured any other way.  A resize is left to the app's own
+         * size commit (the compositor honours a toplevel's requested size), which
+         * already works and is Phase 3's concern. */
+        if (held && moved && !(swp_flags & SWP_NOSENDCHANGING))
         {
-            UINT edge = XDG_TOPLEVEL_RESIZE_EDGE_NONE;
-            if (resized)
-            {
-                if (n->top != o->top) edge |= XDG_TOPLEVEL_RESIZE_EDGE_TOP;
-                if (n->bottom != o->bottom) edge |= XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
-                if (n->left != o->left) edge |= XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
-                if (n->right != o->right) edge |= XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
-            }
             data->drag_pending = TRUE;
-            data->drag_is_resize = resized;
-            data->drag_resize_edge = edge;
-            TRACE("hwnd %p: app %s with button held, handing to the compositor\n", hwnd, resized ? "resize" : "move");
+            data->drag_is_resize = FALSE;
+            TRACE_(handoff)("hwnd %p: app move with button held, handing to the compositor\n", hwnd);
         }
     }
 
@@ -600,6 +644,7 @@ void wayland_start_compositor_drag(struct wayland_win_data *data)
 {
     struct wayland_surface *surface = data->wayland_surface;
     struct wl_seat *wl_seat;
+    HWND focused;
     uint32_t serial = 0;
     INPUT input = {0};
 
@@ -607,9 +652,17 @@ void wayland_start_compositor_drag(struct wayland_win_data *data)
     if (!surface || !wayland_surface_is_toplevel(surface)) return;
 
     pthread_mutex_lock(&process_wayland.pointer.mutex);
-    if (process_wayland.pointer.focused_hwnd == data->hwnd) serial = process_wayland.pointer.button_serial;
+    focused = process_wayland.pointer.focused_hwnd;
+    serial = process_wayland.pointer.button_serial;
     process_wayland.pointer.button_serial = 0;
     pthread_mutex_unlock(&process_wayland.pointer.mutex);
+
+    /* The button is usually held over a child subsurface of the toplevel, not
+     * the toplevel itself, so also accept its root ancestor (see the hand-off
+     * decision in WAYLAND_WindowPosChanged). */
+    if (serial && focused != data->hwnd &&
+        (!focused || NtUserGetAncestor(focused, GA_ROOT) != data->hwnd))
+        serial = 0;
     if (!serial) return;
 
     pthread_mutex_lock(&process_wayland.seat.mutex);
@@ -622,7 +675,7 @@ void wayland_start_compositor_drag(struct wayland_win_data *data)
     }
     pthread_mutex_unlock(&process_wayland.seat.mutex);
     wl_display_flush(process_wayland.wl_display);
-    TRACE("hwnd %p: compositor %s started (serial %u)\n", data->hwnd, data->drag_is_resize ? "resize" : "move", serial);
+    TRACE_(handoff)("hwnd %p: compositor %s started (serial %u)\n", data->hwnd, data->drag_is_resize ? "resize" : "move", serial);
 
     input.type = INPUT_MOUSE;
     input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
