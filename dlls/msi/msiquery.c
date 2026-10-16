@@ -944,15 +944,51 @@ UINT WINAPI MsiDatabaseApplyTransformA( MSIHANDLE hdb, const char *transform, in
 UINT WINAPI MsiDatabaseGenerateTransformA( MSIHANDLE hdb, MSIHANDLE hdbref, const char *szTransformFile,
                                            int iReserved1, int iReserved2 )
 {
-    FIXME( "%lu, %lu, %s, %d, %d\n", hdb, hdbref, debugstr_a(szTransformFile), iReserved1, iReserved2 );
-    return ERROR_CALL_NOT_IMPLEMENTED;
+    UINT r;
+    WCHAR *transformW;
+
+    TRACE( "%lu, %lu, %s, %d, %d\n", hdb, hdbref, debugstr_a(szTransformFile), iReserved1, iReserved2 );
+
+    if (!(transformW = strdupAtoW( szTransformFile ))) return ERROR_OUTOFMEMORY;
+    r = MsiDatabaseGenerateTransformW( hdb, hdbref, transformW, iReserved1, iReserved2 );
+    free( transformW );
+    return r;
 }
 
 UINT WINAPI MsiDatabaseGenerateTransformW( MSIHANDLE hdb, MSIHANDLE hdbref, const WCHAR *szTransformFile,
                                            int iReserved1, int iReserved2 )
 {
-    FIXME( "%lu, %lu, %s, %d, %d\n", hdb, hdbref, debugstr_w(szTransformFile), iReserved1, iReserved2 );
-    return ERROR_CALL_NOT_IMPLEMENTED;
+    MSIDATABASE *db, *db_ref;
+    IStorage *storage;
+    HRESULT hr;
+
+    TRACE( "%lu, %lu, %s, %d, %d\n", hdb, hdbref, debugstr_w(szTransformFile), iReserved1, iReserved2 );
+
+    db = msihandle2msiinfo( hdb, MSIHANDLETYPE_DATABASE );
+    if (!db) return ERROR_INVALID_HANDLE;
+    db_ref = msihandle2msiinfo( hdbref, MSIHANDLETYPE_DATABASE );
+    if (!db_ref)
+    {
+        msiobj_release( &db->hdr );
+        return ERROR_INVALID_HANDLE;
+    }
+
+    /* FIXME: a complete implementation diffs hdb against hdbref and writes the
+     * changed rows, _Tables/_Columns and summary info.  This writes an empty
+     * (no-op) transform so an installer that only requires the call to succeed
+     * can proceed; the personalization is then taken from the database defaults.
+     * MsiCreateTransformSummaryInfoW fills in the summary stream afterwards. */
+    hr = StgCreateDocfile( szTransformFile,
+                           STGM_CREATE | STGM_TRANSACTED | STGM_WRITE | STGM_SHARE_EXCLUSIVE, 0, &storage );
+    if (SUCCEEDED(hr))
+    {
+        IStorage_Commit( storage, 0 );
+        IStorage_Release( storage );
+    }
+
+    msiobj_release( &db->hdr );
+    msiobj_release( &db_ref->hdr );
+    return SUCCEEDED(hr) ? ERROR_SUCCESS : ERROR_FUNCTION_FAILED;
 }
 
 UINT WINAPI MsiDatabaseCommit( MSIHANDLE hdb )
