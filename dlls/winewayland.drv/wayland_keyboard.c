@@ -839,14 +839,53 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
 
     pthread_mutex_lock(&keyboard->mutex);
     if (keyboard->focused_hwnd == hwnd)
+    {
+        /* The foreground window is updated in
+         * wayland_keyboard_update_foreground(), once it is known that the
+         * focus did not just move to another of our own surfaces. */
         keyboard->focused_hwnd = NULL;
+        keyboard->foreground_lost_hwnd = hwnd;
+    }
     pthread_mutex_unlock(&keyboard->mutex);
 
     /* The spec for the leave event tells us to treat all keys as released,
      * and for any key repetition to stop. */
     release_all_keys(hwnd);
+}
 
-    /* FIXME: update foreground window as well */
+/***********************************************************************
+ *           wayland_keyboard_update_foreground
+ *
+ * Give up the foreground window if keyboard focus left our surfaces, so that
+ * the window that lost focus gets deactivated like it would on Windows.
+ *
+ * This cannot be done in the leave event handler: a focus change between two
+ * of our own surfaces sends a leave for the old one and an enter for the new
+ * one, and only once the whole batch of events has been dispatched is it
+ * known that the focus did not stay in Wine.  The X11 driver can ask its
+ * server that question synchronously, through is_current_process_focused();
+ * here the answer is the focused_hwnd state left behind by the batch.
+ */
+void wayland_keyboard_update_foreground(void)
+{
+    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    HWND hwnd;
+
+    pthread_mutex_lock(&keyboard->mutex);
+    hwnd = keyboard->foreground_lost_hwnd;
+    if (keyboard->focused_hwnd) hwnd = NULL;
+    keyboard->foreground_lost_hwnd = NULL;
+    pthread_mutex_unlock(&keyboard->mutex);
+
+    if (!hwnd) return;
+
+    /* Check again that the window which lost focus is still the foreground
+     * window: in most cases it has changed it itself already, by handling the
+     * focus change, in which case it must be left alone. */
+    if (hwnd != NtUserGetForegroundWindow()) return;
+
+    TRACE("hwnd %p lost focus, setting foreground window to the desktop\n", hwnd);
+    NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
 }
 
 static void send_right_control(HWND hwnd, uint32_t state)

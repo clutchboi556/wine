@@ -119,6 +119,9 @@ static NTSTATUS waylanddrv_unix_read_events(void *arg)
 
         while (wl_display_prepare_read_queue(display, queue) != 0)
             if (wl_display_dispatch_queue_pending(display, queue) == -1) goto error;
+        /* Events dispatched here may have moved the keyboard focus out of
+         * Wine: act on that before blocking in poll(). */
+        wayland_keyboard_update_foreground();
         wl_display_flush(display);
 
         /* wake up in time to present contents whose frame callback never came */
@@ -133,6 +136,7 @@ static NTSTATUS waylanddrv_unix_read_events(void *arg)
             if (ret < 0 && errno != EINTR) goto error;
         }
         if (wl_display_dispatch_queue_pending(display, queue) == -1) goto error;
+        wayland_keyboard_update_foreground();
         wayland_present_expired();
     }
 

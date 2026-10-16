@@ -94,6 +94,9 @@ struct wayland_keyboard
     struct xkb_context *xkb_context;
     struct xkb_state *xkb_state;
     HWND focused_hwnd;
+    /* The window that lost focus, or NULL. Handled once the whole batch of
+     * events that contained its leave event has been dispatched. */
+    HWND foreground_lost_hwnd;
     pthread_mutex_t mutex;
 };
 
@@ -450,6 +453,7 @@ void wayland_window_init(void);
 
 void wayland_keyboard_init(struct wl_keyboard *wl_keyboard);
 void wayland_keyboard_deinit(void);
+void wayland_keyboard_update_foreground(void);
 const KBDTABLES *WAYLAND_KbdLayerDescriptor(HKL hkl);
 void WAYLAND_ReleaseKbdTables(const KBDTABLES *);
 void activate_keyboard_hkl(HWND hwnd, BOOL ime);
