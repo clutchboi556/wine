@@ -396,6 +396,21 @@ static BOOL floating_palettes_enabled(void)
     return enabled;
 }
 
+/* Phase B of the floating-palette work: hand the app's own move/resize of such
+ * a toplevel to the compositor (xdg_toplevel_move/resize).  Kept separate from
+ * floating_palettes_enabled so the toplevel change can be tested without it
+ * (WINEWAYLAND_PALETTE_DRAG=1). */
+static BOOL palette_drag_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv("WINEWAYLAND_PALETTE_DRAG");
+        enabled = env && *env && *env != '0';
+    }
+    return enabled;
+}
+
 /***********************************************************************
  *		is_window_managed
  *
@@ -503,7 +518,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * pointer button is held on it is being dragged by the user through the
      * app's own code (custom title bars and grips: AutoCAD's palettes). The
      * compositor ignores client positions, so hand the drag to it. */
-    if (floating_palettes_enabled() && managed && surface && data->wayland_surface && (style & WS_VISIBLE) &&
+    if (palette_drag_enabled() && managed && surface && data->wayland_surface && (style & WS_VISIBLE) &&
         wayland_surface_is_toplevel(data->wayland_surface))
     {
         const RECT *o = &data->rects.window, *n = &new_rects->window;
