@@ -107,6 +107,11 @@ static void* (__cdecl *p__RTDynamicCast)(void*,int,void*,void*,int);
 /*Demangle*/
 static char* (__cdecl *p__unDName)(char*,const char*,int,void*,void*,unsigned short int);
 
+/* exception object registration */
+static unsigned int (__cdecl *p__CxxQueryExceptionSize)(void);
+static BOOL (__cdecl *p__CxxRegisterExceptionObject)(EXCEPTION_POINTERS*,void*);
+static void (__cdecl *p__CxxUnregisterExceptionObject)(void*,BOOL);
+
 
 /* Emulate a __thiscall */
 #ifdef __i386__
@@ -167,6 +172,10 @@ static BOOL InitFunctionPtrs(void)
     SET(p__RTDynamicCast, "__RTDynamicCast");
 
     SET(p__unDName,"__unDName");
+
+    SET(p__CxxQueryExceptionSize, "__CxxQueryExceptionSize");
+    SET(p__CxxRegisterExceptionObject, "__CxxRegisterExceptionObject");
+    SET(p__CxxUnregisterExceptionObject, "__CxxUnregisterExceptionObject");
 
     /* Extremely early versions export logic_error, and crash in RTTI */
     if (sizeof(void *) > sizeof(int))  /* 64-bit initialization */
@@ -1350,6 +1359,46 @@ static void test_demangle(void)
     }
 }
 
+/* __CxxQueryExceptionSize() tells callers how much space to reserve for the
+ * object that __CxxRegisterExceptionObject() fills in: a cxx_frame_info, i.e.
+ * a frame_info (object, next) followed by rec and context.  Those two trailing
+ * fields are the reason the answer is larger than a frame_info, and a caller
+ * that reserves the size it is given -- .NET's JIT does -- must not have them
+ * written outside its reservation.  MSVC's runtime returns 0x20 on x86-64
+ * (vcruntime140, 0x180004510: b8 20 00 00 00 c3). */
+struct cxx_frame_info_size_test
+{
+    void *object;
+    void *next;
+    EXCEPTION_RECORD *rec;
+    CONTEXT *context;
+};
+
+static void test_CxxQueryExceptionSize(void)
+{
+    EXCEPTION_RECORD rec;
+    EXCEPTION_POINTERS ep;
+    unsigned char *frame;
+    unsigned int size, i, clobbered = 0;
+
+    size = p__CxxQueryExceptionSize();
+    ok(size == sizeof(struct cxx_frame_info_size_test), "got %u, expected %u\n",
+       size, (unsigned int)sizeof(struct cxx_frame_info_size_test));
+
+    memset(&rec, 0, sizeof(rec));
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = NULL;
+
+    frame = malloc(size + 0x40);
+    memset(frame, 0xab, size + 0x40);
+    ok(p__CxxRegisterExceptionObject(&ep, frame), "registering failed\n");
+    p__CxxUnregisterExceptionObject(frame, FALSE);
+
+    for (i = size; i < size + 0x40; i++) if (frame[i] != 0xab) clobbered++;
+    ok(!clobbered, "%u byte(s) past the %u-byte frame_info were written\n", clobbered, size);
+    free(frame);
+}
+
 START_TEST(cpp)
 {
   if (!InitFunctionPtrs())
@@ -1363,4 +1412,5 @@ START_TEST(cpp)
   test_rtti();
   test_demangle_datatype();
   test_demangle();
+  test_CxxQueryExceptionSize();
 }

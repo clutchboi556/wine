@@ -808,7 +808,9 @@ int CDECL __CxxExceptionFilter( EXCEPTION_POINTERS *ptrs, const type_info *ti, U
  */
 unsigned int CDECL __CxxQueryExceptionSize(void)
 {
-    return sizeof(cxx_exception_type);
+    /* callers use this to size the buffer they pass to
+     * __CxxRegisterExceptionObject, which wants a cxx_frame_info */
+    return sizeof(cxx_frame_info);
 }
 
 /*********************************************************************
