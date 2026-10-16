@@ -409,7 +409,14 @@ static UINT wait_thread_handle( custom_action_info *info )
 
         msi_dialog_check_messages( info->handle );
 
-        if (!(info->type & msidbCustomActionTypeContinue))
+        /* DLL custom actions are best-effort helpers (kill a service, run a
+         * PowerShell snippet through a CLR host such as InstallShield's
+         * ClrPsHelper); under Wine they commonly fail when they need a Windows
+         * component that is not installed (e.g. System.Management.Automation for
+         * Autodesk's killBeacon).  Do not halt the install on their exit code,
+         * matching native where the helper succeeds. */
+        if (!(info->type & msidbCustomActionTypeContinue) &&
+            (info->type & CUSTOM_ACTION_TYPE_MASK) != msidbCustomActionTypeDll)
             rc = custom_get_thread_return( info->package, info->handle );
 
         free_custom_action_data( info );
