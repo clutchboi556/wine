@@ -329,6 +329,11 @@ struct wayland_surface
     /* frame callback of the last commit: while it is pending, new contents
      * accumulate and are presented at the callback (one commit per frame) */
     struct wl_callback *frame_cb;
+    /* EXPERIMENT (WINEWAYLAND_SCALED_SIZE): the size the compositor was last told
+     * about through the viewport, committed on its own when it changes so a
+     * palette follows a resize while its contents are deferred (see
+     * wayland_surface_reconfigure_size) */
+    int scaled_width, scaled_height;
 
     struct wayland_surface_config pending, requested, processing, current;
     BOOL resizing;

@@ -923,6 +923,9 @@ static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
      * clip is rarely needed, so never confine; the pointer *lock* (relative
      * motion for games) above is unchanged. */
     needs_confine = FALSE;
+    TRACE_(handoff)("update_constraint wl_surface=%p confine_rect=%s needs_lock=%d needs_confine=%d is_visible=%d force_lock=%d wl_pointer=%p\n",
+                    wl_surface, confine_rect ? wine_dbgstr_rect(confine_rect) : "NULL",
+                    needs_lock, needs_confine, is_visible, force_lock, pointer->wl_pointer);
 
     if (!needs_confine && pointer->zwp_confined_pointer_v1)
     {
@@ -935,6 +938,8 @@ static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
     if (!needs_lock && pointer->zwp_locked_pointer_v1)
     {
         TRACE("Unlocking from hwnd=%p\n", pointer->constraint_hwnd);
+        TRACE_(handoff)("pointer lock: Unlocking pointer from hwnd=%p\n",
+                        pointer->constraint_hwnd);
         zwp_locked_pointer_v1_destroy(pointer->zwp_locked_pointer_v1);
         pointer->zwp_locked_pointer_v1 = NULL;
         pointer->constraint_hwnd = NULL;
@@ -994,6 +999,8 @@ static void wayland_pointer_update_constraint(struct wl_surface *wl_surface,
                     ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
             pointer->constraint_hwnd = hwnd;
             TRACE("Locking to hwnd=%p\n", pointer->constraint_hwnd);
+            TRACE_(handoff)("pointer lock: Locking pointer to hwnd=%p\n",
+                            pointer->constraint_hwnd);
         }
     }
 
@@ -1100,6 +1107,8 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     BOOL is_palette = FALSE;
 
     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
+    TRACE_(handoff)("WAYLAND_ClipCursor clip=%s reset=%d\n",
+                    clip ? wine_dbgstr_rect(clip) : "NULL", reset);
 
     if (pointer_grab_disabled())
     {

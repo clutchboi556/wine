@@ -974,17 +974,68 @@ static int palette_commit_defer_ms(void)
     return ms;
 }
 
+/* Hold state for defer_popup_flush: one record per window, because a single
+ * global one made every window's first flush during startup steal the record and
+ * starve all flushes, which left the application unresponsive (2026-10-07). */
+#define DEFER_SLOTS 4
+static struct
+{
+    HWND hwnd;
+    DWORD start;
+    LONG width, height;
+    BOOL holding;
+} defer_slots[DEFER_SLOTS];
+static unsigned int defer_next;
+
+static BOOL defer_should_hold( HWND hwnd, LONG width, LONG height, int defer_ms )
+{
+    unsigned int i, slot = 0;
+    DWORD now = NtGetTickCount();
+
+    for (i = 0; i < DEFER_SLOTS; i++)
+        if (defer_slots[i].hwnd == hwnd) break;
+    if (i == DEFER_SLOTS)
+    {
+        /* a window we have not seen: take the next slot and only hold it once its
+         * size changes from what is recorded, i.e. once it is being resized */
+        slot = defer_next++ % DEFER_SLOTS;
+        defer_slots[slot].hwnd = hwnd;
+        defer_slots[slot].width = width;
+        defer_slots[slot].height = height;
+        defer_slots[slot].holding = FALSE;
+        return FALSE;
+    }
+    slot = i;
+
+    if (defer_slots[slot].holding)
+    {
+        if ((int)(now - defer_slots[slot].start) < defer_ms) return TRUE;
+        defer_slots[slot].holding = FALSE;
+    }
+    else if (defer_slots[slot].width != width || defer_slots[slot].height != height)
+    {
+        defer_slots[slot].holding = TRUE;
+        defer_slots[slot].start = now;
+        return TRUE;
+    }
+
+    defer_slots[slot].width = width;
+    defer_slots[slot].height = height;
+    return FALSE;
+}
+
 /* TRUE if this flush should be held back: a resizable caption-less popup (a tool
- * palette) that still has invalid content and has been held for less than
- * palette_commit_defer_ms. */
+ * palette) that has invalid content *and* is being resized -- held from the first
+ * flush after its size changed, for at most palette_commit_defer_ms, so a palette
+ * that merely repaints is never held back and the frame a resize settles on is
+ * always presented. */
 static BOOL defer_popup_flush( struct window_surface *surface )
 {
-    static HWND defer_hwnd;
-    static DWORD defer_start;
     int defer_ms = palette_commit_defer_ms();
-    DWORD style, now;
+    DWORD style;
     HRGN rgn;
     UINT flags;
+    LONG width, height;
 
     if (!defer_ms || surface == &dummy_surface) return FALSE;
 
@@ -994,19 +1045,13 @@ static BOOL defer_popup_flush( struct window_surface *surface )
         return FALSE;
 
     if ((rgn = get_update_region( surface->hwnd, &flags, NULL )))
-    {
         NtGdiDeleteObjectApp( rgn );
-        now = NtGetTickCount();
-        if (defer_hwnd != surface->hwnd)
-        {
-            defer_hwnd = surface->hwnd;
-            defer_start = now;
-            return TRUE;
-        }
-        if ((int)(now - defer_start) < defer_ms) return TRUE;
-    }
-    defer_hwnd = 0;
-    return FALSE;
+    else
+        return FALSE;
+
+    width = surface->rect.right - surface->rect.left;
+    height = surface->rect.bottom - surface->rect.top;
+    return defer_should_hold( surface->hwnd, width, height, defer_ms );
 }
 
 void window_surface_flush( struct window_surface *surface )

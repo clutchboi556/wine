@@ -35,6 +35,20 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
+/* EXPERIMENT (2026-10-07): commit a palette's size on its own so the compositor
+ * scales the frame it already has to a new size while the contents are deferred
+ * (see wayland_surface_reconfigure_size). */
+static BOOL scaled_size_commit_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv("WINEWAYLAND_SCALED_SIZE");
+        enabled = env && *env && *env != '0';
+    }
+    return enabled;
+}
+
 static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
                                          uint32_t serial)
 {
@@ -197,6 +211,10 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
     TRACE("surface=%p\n", surface);
 
     surface->hwnd = hwnd;
+    /* Cached here (and refreshed in WAYLAND_WindowPosChanged), because the flush
+     * path needs the style and must not call into the server for it: see the
+     * comment on the field. */
+    surface->style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
     if (!surface->wl_surface)
     {
@@ -736,12 +754,45 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
                                              int width, int height)
 {
+    int prev_width = surface->scaled_width, prev_height = surface->scaled_height;
+
     TRACE("hwnd=%p size=%dx%d\n", surface->hwnd, width, height);
 
     if (width != 0 && height != 0)
         wp_viewport_set_destination(surface->wp_viewport, width, height);
     else
         wp_viewport_set_destination(surface->wp_viewport, -1, -1);
+
+    /* EXPERIMENT (WINEWAYLAND_SCALED_SIZE=1): a viewport destination only takes
+     * effect on a commit, and the flush that would commit is what 0029/0034 defer
+     * -- so a palette being resized keeps its old *size* until the deferred
+     * contents arrive, which reads as "reacts slowly and snaps".  Commit the size
+     * on its own instead: the compositor then shows the frame it already has
+     * scaled to the new size, so the outline follows the drag while the contents
+     * stay coalesced (scaling the last frame is how terminals resize).
+     *
+     * Only for a caption-less resizable popup, i.e. a tool palette -- the shape
+     * 0034 keys on, read from the style cached on the surface.  Calling
+     * NtUserGetWindowLongW here instead deadlocked the application: this runs on
+     * the flush path, inside a win32u callback that may hold locks, and the call
+     * is a server round trip.  As a subsurface (the normal case) a palette
+     * receives no configure, so a commit here cannot start a configure/commit
+     * round trip; as a floating toplevel the sizes converge after one round.
+     * Also gated on a surface that already presented contents (`frame_cb` only
+     * exists after a commit with a buffer, and a commit with no buffer on a
+     * never-mapped surface asks the compositor to unmap it) and on not being
+     * inside a compositor resize, where the compositor owns the size. */
+    if (scaled_size_commit_enabled() && surface->frame_cb && !surface->resizing &&
+        (surface->style & (WS_POPUP | WS_THICKFRAME)) == (WS_POPUP | WS_THICKFRAME) &&
+        !(surface->style & WS_CAPTION) &&
+        width != 0 && height != 0 && (width != prev_width || height != prev_height) &&
+        !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+    {
+        TRACE("hwnd=%p committing palette size %dx%d on its own\n", surface->hwnd, width, height);
+        surface->scaled_width = width;
+        surface->scaled_height = height;
+        wl_surface_commit(surface->wl_surface);
+    }
 }
 
 /**********************************************************************
