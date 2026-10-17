@@ -452,6 +452,7 @@ static inline const char *debugstr_sockopt(int level, int optname)
             DEBUG_SOCKOPT(IP_ADD_MEMBERSHIP);
             DEBUG_SOCKOPT(IP_DONTFRAGMENT);
             DEBUG_SOCKOPT(IP_DROP_MEMBERSHIP);
+            DEBUG_SOCKOPT(IP_ECN);
             DEBUG_SOCKOPT(IP_HDRINCL);
             DEBUG_SOCKOPT(IP_MULTICAST_IF);
             DEBUG_SOCKOPT(IP_MULTICAST_LOOP);
@@ -2200,6 +2201,15 @@ int WINAPI getsockopt( SOCKET s, int level, int optname, char *optval, int *optl
         case IP_DONTFRAGMENT:
             return server_getsockopt( s, IOCTL_AFD_WINE_GET_IP_DONTFRAGMENT, optval, optlen );
 
+        case IP_ECN:
+            if (*optlen < sizeof(DWORD) || !optval)
+            {
+                *optlen = 0;
+                SetLastError( WSAEFAULT );
+                return SOCKET_ERROR;
+            }
+            return server_getsockopt( s, IOCTL_AFD_WINE_GET_IP_ECN, optval, optlen );
+
         case IP_HDRINCL:
             return server_getsockopt( s, IOCTL_AFD_WINE_GET_IP_HDRINCL, optval, optlen );
 
@@ -3660,6 +3670,14 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
 
         case IP_DROP_SOURCE_MEMBERSHIP:
             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_DROP_SOURCE_MEMBERSHIP, optval, optlen );
+
+        case IP_ECN:
+            if (optlen < sizeof(DWORD) || !optval)
+            {
+                SetLastError( WSAEFAULT );
+                return SOCKET_ERROR;
+            }
+            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_ECN, optval, optlen );
 
         case IP_HDRINCL:
             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_HDRINCL, optval, optlen );

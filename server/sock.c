@@ -283,6 +283,7 @@ struct sock
     int                 peer_addr_len; /* peer name length */
     unsigned int        rcvbuf;      /* advisory recv buffer size */
     unsigned int        sndbuf;      /* advisory send buffer size */
+    unsigned int        ecn;         /* IP_ECN option value */
     unsigned int        rcvtimeo;    /* receive timeout in ms */
     unsigned int        sndtimeo;    /* send timeout in ms */
     struct
@@ -1805,6 +1806,7 @@ static struct sock *create_socket(void)
     sock->exclusiveaddruse = 0;
     sock->rcvbuf = 0;
     sock->sndbuf = 0;
+    sock->ecn = 0;
     sock->rcvtimeo = 0;
     sock->sndtimeo = 0;
     sock->icmp_fixup_data_len = 0;
@@ -2132,6 +2134,7 @@ static struct sock *accept_socket( struct sock *sock )
         acceptsock->exclusiveaddruse    = sock->exclusiveaddruse;
         acceptsock->sndbuf              = sock->sndbuf;
         acceptsock->rcvbuf              = sock->rcvbuf;
+        acceptsock->ecn                 = sock->ecn;
         acceptsock->sndtimeo            = sock->sndtimeo;
         acceptsock->rcvtimeo            = sock->rcvtimeo;
         acceptsock->connect_time        = current_time;
@@ -3514,6 +3517,45 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             sock->rcvbuf = rcvbuf;
         else
             set_error( sock_get_ntstatus( errno ) );
+        return;
+    }
+
+    case IOCTL_AFD_WINE_GET_IP_ECN:
+    {
+        int ecn = sock->ecn;
+
+        /* Windows only reports the value for datagram and raw sockets. */
+        if (is_tcp_socket( sock ))
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+
+        if (get_reply_max_size() < sizeof(ecn))
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+
+        set_reply_data( &ecn, sizeof(ecn) );
+        return;
+    }
+
+    case IOCTL_AFD_WINE_SET_IP_ECN:
+    {
+        DWORD ecn;
+
+        if (get_req_data_size() < sizeof(ecn))
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+        ecn = *(DWORD *)get_req_data();
+
+        /* ECN marking of outgoing packets is left to IP_TOS, which the
+         * application sets itself; only remember the requested capability
+         * so that getsockopt() can report it back. */
+        sock->ecn = ecn;
         return;
     }
 
