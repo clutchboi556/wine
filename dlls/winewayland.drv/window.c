@@ -1074,8 +1074,24 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         wayland_configure_window(hwnd);
         return 0;
     case WM_WAYLAND_SET_FOREGROUND:
+    {
+        /* The message is posted when the keyboard enter event arrives, and
+         * its thread may have a backlog to work through before it is
+         * dispatched: the focus can have left this window (and Wine) in the
+         * meantime, and wayland_keyboard_update_foreground() has then
+         * already released the foreground window.  Claiming it now would
+         * name a window the user is no longer in, which is exactly what
+         * these two together exist to prevent. */
+        HWND focused;
+
+        pthread_mutex_lock(&process_wayland.keyboard.mutex);
+        focused = process_wayland.keyboard.focused_hwnd;
+        pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+        if (focused != hwnd) return 0;
+
         NtUserSetForegroundWindowInternal(hwnd);
         return 0;
+    }
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;
