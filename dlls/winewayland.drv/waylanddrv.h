@@ -201,6 +201,13 @@ struct wayland
     struct wl_list output_list;
     /* Protects the output_list and the wayland_output.current states. */
     pthread_mutex_t output_mutex;
+    /* The last serial of a *user* input event (a key press or release, a
+     * pointer button), used to vouch for an xdg-activation token. Focus
+     * enter/leave and modifier updates carry serials too, but they are the
+     * compositor talking to us, not the user acting: arming the guard with
+     * them would let any client activation request (a dialog's
+     * SetForegroundWindow, an application re-activating itself) pull the
+     * focus away from the window the user is working in. */
     LONG input_serial;
 };
 

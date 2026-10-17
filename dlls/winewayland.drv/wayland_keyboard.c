@@ -791,8 +791,6 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
     struct wayland_win_data *data;
     HWND hwnd;
 
-    InterlockedExchange(&process_wayland.input_serial, serial);
-
     if (!wl_surface) return;
 
     /* The wl_surface user data remains valid and immutable for the whole
@@ -827,8 +825,6 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
     HWND hwnd;
-
-    InterlockedExchange(&process_wayland.input_serial, serial);
 
     if (!wl_surface) return;
 
@@ -930,8 +926,6 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
                                       uint32_t xkb_group)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
-
-    InterlockedExchange(&process_wayland.input_serial, serial);
 
     if (!wayland_keyboard_get_focused_hwnd()) return;
 

@@ -1021,10 +1021,12 @@ void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
     pthread_mutex_unlock(&process_wayland.keyboard.mutex);
     if (focused == hwnd) return;
 
-    /* Only ask on behalf of an input event we received: a token without a
-     * serial is a focus-stealing request (a freshly launched program pulling
-     * the user to its workspace), and compositors that don't reject it
-     * would let every Wine launch do that. */
+    /* Only ask on behalf of a user input event we received: a token without
+     * a serial is a focus-stealing request (a freshly launched program
+     * pulling the user to its workspace), and compositors that don't reject
+     * it would let every Wine launch do that. input_serial is armed by the
+     * keyboard and pointer button handlers only: the serials on focus
+     * enter/leave and modifier updates belong to no user action. */
     serial = InterlockedCompareExchange(&process_wayland.input_serial, 0, 0);
     if (!serial) return;
 
