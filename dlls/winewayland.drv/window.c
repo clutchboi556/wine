@@ -401,6 +401,26 @@ static HWND popup_anchor(HWND hwnd, const RECT *rect)
     return ok ? anchor : 0;
 }
 
+/* An unowned window that carries WS_CAPTION but has no caption text, and that
+ * the application shows without activating it: a notification toast.
+ *
+ * AutoCAD's AdP toast (class "adpsdknotification") has exactly this shape:
+ * WS_CLIPSIBLINGS|WS_CAPTION -- an *overlapped* window, not a WS_POPUP -- with
+ * an empty title.  The caption-less popup test below therefore misses it, and
+ * the compositor turns the small helper window into an empty-titled toplevel
+ * of its own, which takes a tile from the application's window.
+ *
+ * A resizable window (WS_THICKFRAME: a floating palette), anything with a
+ * title, and anything the application shows with activation are real windows
+ * and keep their surface. */
+static BOOL is_captionless_toast(HWND hwnd, DWORD style, UINT swp_flags)
+{
+    if ((style & WS_CHILD) || (style & WS_CAPTION) != WS_CAPTION) return FALSE;
+    if (style & WS_THICKFRAME) return FALSE;
+    if (!(swp_flags & SWP_NOACTIVATE)) return FALSE;
+    return NtUserGetWindowTextLength(hwnd) == 0;
+}
+
 /* Hands a subsurface back its own toplevel.
  *
  * A subsurface's role belongs to the surface it hangs on, so it cannot outlive
@@ -609,7 +629,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * null -- but it is drawn as part of the application, like the owned popups
      * above.
      *
-     * Decide that from the window's shape alone.  Both of win32u's rules fail
+     * Decide that from the window's shape alone: a caption-less popup, or an
+     * overlapped window with an empty caption (see is_captionless_toast above:
+     * AutoCAD's AdP toast).  Both of win32u's rules fail
      * here: a bubble is shown without activation, so it is not "managed", and
      * the owner hint is a WindowFromPoint() guess at the popup's corner, which
      * misses whenever that corner is not over the application -- and would
@@ -617,7 +639,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * exceed its parent's surface.  Anything that is not drawn inside the
      * application's toplevel and smaller than it cannot be drawn as part of
      * it, so it keeps the surface of its own that it asked for. */
-    if (!win_owner && !fullscreen && (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION &&
+    if (!win_owner && !fullscreen &&
+        (((style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION) ||
+         is_captionless_toast(hwnd, style, swp_flags)) &&
         !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
     {
         if ((anchor = popup_anchor(hwnd, &new_rects->window)))
