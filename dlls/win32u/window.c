@@ -631,13 +631,23 @@ HWND is_current_process_window( HWND hwnd )
 /* see IsWindow */
 BOOL is_window( HWND hwnd )
 {
+    WND *win;
+    BOOL destroyed = FALSE;
+
     if (!hwnd) return FALSE;
-    if (!is_valid_entry( hwnd, NTUSER_OBJ_WINDOW ))
+    if (!is_valid_entry( hwnd, NTUSER_OBJ_WINDOW )) goto invalid;
+    /* As on Windows, the handle is no longer valid once WM_NCDESTROY has been sent. */
+    if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
     {
-        RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
-        return FALSE;
+        destroyed = (win->flags & WIN_DESTROYED) != 0;
+        release_win_ptr( win );
     }
+    if (destroyed) goto invalid;
     return TRUE;
+
+invalid:
+    RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
+    return FALSE;
 }
 
 /* see GetWindowThreadProcessId */
@@ -5518,6 +5528,13 @@ LRESULT destroy_window( HWND hwnd )
         wine_server_call( req );
     }
     SERVER_END_REQ;
+
+    /* Invalidate the handle now: WM_NCDESTROY handlers must not see it as valid. */
+    if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS)
+    {
+        win->flags |= WIN_DESTROYED;
+        release_win_ptr( win );
+    }
 
     send_message( hwnd, WM_NCDESTROY, 0, 0 );
 
