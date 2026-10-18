@@ -357,6 +357,82 @@ static HWND *build_hwnd_list(void)
     }
 }
 
+/* The last window this process mapped as a managed toplevel.  An unowned
+ * notification bubble has no Win32 owner to hang on, so the window it is
+ * being shown over -- the application's own toplevel -- is the only surface
+ * owner there is. */
+static HWND last_managed_toplevel;
+
+/* Returns the toplevel an unowned caption-less popup belongs to, or 0.
+ *
+ * Only a popup that is visibly smaller than that toplevel *and* drawn within
+ * its rect is taken for a bubble.  A caption-less popup of the same size is a
+ * part of the application's own UI (a WebView2 host the size of the frame), the
+ * loading screen is as large as the frame it covers, and one shown outside the
+ * application's rect (a toast in the corner of the screen) cannot be drawn as
+ * part of it at all.  All of those must keep a surface of their own. */
+static HWND popup_anchor(HWND hwnd, const RECT *rect)
+{
+    static int enabled = -1;
+    struct wayland_win_data *data;
+    HWND anchor = last_managed_toplevel;
+    RECT anchor_rect;
+    BOOL ok = FALSE;
+
+    if (enabled < 0)
+    {
+        /* Kill switch while the shape is being verified on the real app: a
+         * popup wrongly demoted is clipped by the window it hangs on. */
+        const char *env = getenv("WINEWAYLAND_POPUP_ANCHOR");
+        enabled = !(env && *env == '0');
+    }
+    if (!enabled) return 0;
+    if (!anchor || anchor == hwnd || !(data = wayland_win_data_get(anchor))) return 0;
+    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
+        (data->wayland_surface->style & WS_VISIBLE))
+    {
+        anchor_rect = data->rects.window;
+        ok = rect->left >= anchor_rect.left && rect->top >= anchor_rect.top &&
+             rect->right <= anchor_rect.right && rect->bottom <= anchor_rect.bottom &&
+             rect->right - rect->left < (anchor_rect.right - anchor_rect.left) / 2 &&
+             rect->bottom - rect->top < (anchor_rect.bottom - anchor_rect.top) / 2;
+    }
+    wayland_win_data_release(data);
+    return ok ? anchor : 0;
+}
+
+/* Hands a subsurface back its own toplevel.
+ *
+ * A subsurface's role belongs to the surface it hangs on, so it cannot outlive
+ * it: the compositor drops the role and the next set_position would be a
+ * protocol error, which kills the client.  A win32-owned popup is destroyed
+ * with its owner and never gets here, but a notification bubble hangs on the
+ * application's window for drawing only, so it can. */
+static void detach_subsurfaces(HWND owner)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    HWND *list;
+    UINT i;
+
+    if (!(list = build_hwnd_list())) return;
+    for (i = 0; list[i] != HWND_BOTTOM; i++)
+    {
+        if (list[i] == owner || !(data = wayland_win_data_get(list[i]))) continue;
+        if ((surface = data->wayland_surface) &&
+            surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE && surface->owner_hwnd == owner)
+        {
+            TRACE("hwnd %p takes its own surface back from %p\n", list[i], owner);
+            wayland_surface_clear_role(surface);
+            surface->role = WAYLAND_SURFACE_ROLE_NONE;
+            wayland_surface_make_toplevel(surface);
+            if (surface->xdg_toplevel) xdg_toplevel_set_parent(surface->xdg_toplevel, NULL);
+        }
+        wayland_win_data_release(data);
+    }
+    free(list);
+}
+
 static BOOL has_owned_popups(HWND hwnd)
 {
     HWND *list;
@@ -471,7 +547,9 @@ void WAYLAND_DestroyWindow(HWND hwnd)
 
     TRACE("%p\n", hwnd);
 
+    detach_subsurfaces(hwnd);
     if (!(data = wayland_win_data_get(hwnd))) return;
+    if (hwnd == last_managed_toplevel) last_managed_toplevel = 0;
     wayland_win_data_destroy(data);
 }
 
@@ -501,6 +579,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct wayland_surface *owner_surface;
     struct wayland_win_data *data, *owner_data;
+    HWND anchor;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
@@ -521,7 +600,33 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         !(floating_palettes_enabled() && (style & WS_THICKFRAME)) &&
         !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
         managed = FALSE;
-    if (!managed && surface) owner = owner_hint ? owner_hint : win_owner;
+    /* An unowned caption-less popup shown over the application's own window (a
+     * notification bubble) is a separate, unowned window on Windows, but it is
+     * drawn over the application and the user never manages it.  As a toplevel
+     * the compositor tiles it, borders it and focuses it, which is felt as the
+     * bubble grabbing the application.  Hang it on that toplevel as a *surface*
+     * owner only: Win32 ownership is untouched -- GetWindow(GW_OWNER) stays
+     * null -- but it is drawn as part of the application, like the owned popups
+     * above.
+     *
+     * Decide that from the window's shape alone.  Both of win32u's rules fail
+     * here: a bubble is shown without activation, so it is not "managed", and
+     * the owner hint is a WindowFromPoint() guess at the popup's corner, which
+     * misses whenever that corner is not over the application -- and would
+     * also clip a popup that is too large to fit, since a subsurface cannot
+     * exceed its parent's surface.  Anything that is not drawn inside the
+     * application's toplevel and smaller than it cannot be drawn as part of
+     * it, so it keeps the surface of its own that it asked for. */
+    if (!win_owner && !fullscreen && (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION &&
+        !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
+    {
+        if ((anchor = popup_anchor(hwnd, &new_rects->window)))
+        {
+            owner = anchor;
+            managed = FALSE;
+        }
+    }
+    else if (!managed && surface) owner = owner_hint ? owner_hint : win_owner;
     else if (managed && win_owner) owner = win_owner;
 
     TRACE("hwnd %p style %#x owner %p managed %d surface owner %p\n", hwnd, (UINT)style, win_owner, managed, owner);
@@ -609,6 +714,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->is_fullscreen = fullscreen;
     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
     data->managed = managed;
+    if (managed && data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface))
+        last_managed_toplevel = hwnd;
 
 
     if (!surface)
