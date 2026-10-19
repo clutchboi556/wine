@@ -29,6 +29,9 @@
 #include <string.h>
 #include <libusb.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "ntstatus.h"
 #include "windef.h"
 #include "winternl.h"
@@ -415,6 +418,74 @@ static struct pipe get_pipe(HANDLE handle)
     return u.pipe;
 }
 
+/* HACK: spacemouse-router shares a 3Dconnexion device's LCD between Wine and
+ * Linux programs, so it has to be the only writer. When it runs, it listens
+ * on $XDG_RUNTIME_DIR/spacemouse-lcd.sock, and bulk OUT transfers to such a
+ * device go there instead of to the device. Without it they go to the device
+ * as usual. */
+static pthread_mutex_t lcd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int lcd_socket = -1;
+
+static int lcd_connect(void)
+{
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    int fd;
+
+    if (!dir || snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/spacemouse-lcd.sock", dir) >= sizeof(addr.sun_path))
+        return -1;
+    if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool write_all(int fd, const void *data, size_t size)
+{
+    const char *p = data;
+    while (size)
+    {
+        ssize_t n = send(fd, p, size, MSG_NOSIGNAL);
+        if (n <= 0) return false;
+        p += n;
+        size -= n;
+    }
+    return true;
+}
+
+/* Whether the router took the transfer. */
+static bool lcd_divert(libusb_device_handle *handle, unsigned char endpoint, const void *data, unsigned int size)
+{
+    struct libusb_device_descriptor desc;
+    unsigned int header[3];
+    bool sent = false;
+    int attempt;
+
+    if (endpoint & LIBUSB_ENDPOINT_IN) return false;
+    if (libusb_get_device_descriptor(libusb_get_device(handle), &desc) || desc.idVendor != 0x256f) return false;
+
+    header[0] = 0x434c4d53; /* "SMLC" */
+    header[1] = endpoint;
+    header[2] = size;
+    pthread_mutex_lock(&lcd_mutex);
+    for (attempt = 0; attempt < 2 && !sent; attempt++)
+    {
+        if (lcd_socket < 0 && (lcd_socket = lcd_connect()) < 0) break;
+        sent = write_all(lcd_socket, header, sizeof(header)) && write_all(lcd_socket, data, size);
+        if (!sent)
+        {
+            close(lcd_socket);
+            lcd_socket = -1;
+        }
+    }
+    pthread_mutex_unlock(&lcd_mutex);
+    if (sent) TRACE("LCD transfer of %u bytes to endpoint %#x handed to spacemouse-router.\n", size, endpoint);
+    return sent;
+}
+
 static NTSTATUS usb_submit_urb(void *args)
 {
     const struct usb_submit_urb_params *params = args;
@@ -445,6 +516,13 @@ static NTSTATUS usb_submit_urb(void *args)
             struct _URB_BULK_OR_INTERRUPT_TRANSFER *req = &urb->UrbBulkOrInterruptTransfer;
             struct pipe pipe = get_pipe(req->PipeHandle);
             struct transfer_ctx *transfer_ctx;
+
+            if (pipe.type == UsbdPipeTypeBulk
+                    && lcd_divert(handle, pipe.endpoint, params->transfer_buffer, req->TransferBufferLength))
+            {
+                urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+                return STATUS_SUCCESS;
+            }
 
             if (!(transfer_ctx = calloc(1, sizeof(*transfer_ctx))))
                 return STATUS_NO_MEMORY;
