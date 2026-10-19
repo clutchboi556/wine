@@ -363,6 +363,30 @@ static HWND *build_hwnd_list(void)
  * owner there is. */
 static HWND last_managed_toplevel;
 
+/* Is hwnd drawn inside anchor's window rect, smaller than half of it in both
+ * directions?  A subsurface cannot exceed its parent's surface and the
+ * compositor gives no window of its own to something drawn inside another, so
+ * that is the test for "the application drew this over its own window". */
+static BOOL anchor_contains(HWND hwnd, HWND anchor, const RECT *rect)
+{
+    struct wayland_win_data *data;
+    RECT anchor_rect;
+    BOOL ok = FALSE;
+
+    if (!anchor || anchor == hwnd || !(data = wayland_win_data_get(anchor))) return FALSE;
+    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
+        (data->wayland_surface->style & WS_VISIBLE))
+    {
+        anchor_rect = data->rects.window;
+        ok = rect->left >= anchor_rect.left && rect->top >= anchor_rect.top &&
+             rect->right <= anchor_rect.right && rect->bottom <= anchor_rect.bottom &&
+             rect->right - rect->left < (anchor_rect.right - anchor_rect.left) / 2 &&
+             rect->bottom - rect->top < (anchor_rect.bottom - anchor_rect.top) / 2;
+    }
+    wayland_win_data_release(data);
+    return ok;
+}
+
 /* Returns the toplevel an unowned caption-less popup belongs to, or 0.
  *
  * Only a popup that is visibly smaller than that toplevel *and* drawn within
@@ -374,10 +398,6 @@ static HWND last_managed_toplevel;
 static HWND popup_anchor(HWND hwnd, const RECT *rect)
 {
     static int enabled = -1;
-    struct wayland_win_data *data;
-    HWND anchor = last_managed_toplevel;
-    RECT anchor_rect;
-    BOOL ok = FALSE;
 
     if (enabled < 0)
     {
@@ -386,19 +406,8 @@ static HWND popup_anchor(HWND hwnd, const RECT *rect)
         const char *env = getenv("WINEWAYLAND_POPUP_ANCHOR");
         enabled = !(env && *env == '0');
     }
-    if (!enabled) return 0;
-    if (!anchor || anchor == hwnd || !(data = wayland_win_data_get(anchor))) return 0;
-    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
-        (data->wayland_surface->style & WS_VISIBLE))
-    {
-        anchor_rect = data->rects.window;
-        ok = rect->left >= anchor_rect.left && rect->top >= anchor_rect.top &&
-             rect->right <= anchor_rect.right && rect->bottom <= anchor_rect.bottom &&
-             rect->right - rect->left < (anchor_rect.right - anchor_rect.left) / 2 &&
-             rect->bottom - rect->top < (anchor_rect.bottom - anchor_rect.top) / 2;
-    }
-    wayland_win_data_release(data);
-    return ok ? anchor : 0;
+    if (!enabled || !last_managed_toplevel) return 0;
+    return anchor_contains(hwnd, last_managed_toplevel, rect) ? last_managed_toplevel : 0;
 }
 
 /* An unowned window that carries WS_CAPTION but has no caption text, and that
@@ -615,11 +624,40 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * kept over it. A *resizable* one (WS_THICKFRAME: a floating palette) is
      * a real window the user drags around and onto other monitors, which only
      * a toplevel can do; its app-driven moves and resizes are handed to the
-     * compositor below. */
-    if (managed && win_owner && !fullscreen && (style & WS_CAPTION) != WS_CAPTION &&
-        !(floating_palettes_enabled() && (style & WS_THICKFRAME)) &&
-        !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
-        managed = FALSE;
+     * compositor below.
+     *
+     * The exception is a flyout the application itself draws inside it: the
+     * WebView2 sign-in notice is a WPF window (class "HwndWrapper[...]")
+     * owned by the frame, style 0x160f0000 -- no WS_CAPTION, but
+     * WS_THICKFRAME -- WS_EX_LAYERED (0x00080100: WebView2 draws it with
+     * per-pixel alpha; some builds add WS_EX_TOPMOST as well), an empty
+     * title, 119x34 inside the 1896x1030 frame.  It is resizable by style
+     * only; nothing lets the user float it anywhere, and as a toplevel it
+     * takes a tile from the application and is decorated.  A floating
+     * palette is *titled* (the Layer palette's window text is "Layer"), and
+     * the sign-in dialog is titled too ("Profile MFE") and far larger, so
+     * existence of a title, plus containment, tells them apart. */
+    if (managed && win_owner && !fullscreen)
+    {
+        DWORD ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+        BOOL flyout = (ex_style & (WS_EX_LAYERED|WS_EX_TOPMOST)) &&
+                      !(ex_style & WS_EX_TOOLWINDOW) &&
+                      !NtUserGetWindowTextLength(hwnd) &&
+                      anchor_contains(hwnd, win_owner, &new_rects->window);
+
+        /* The test does not look at WS_CAPTION on purpose: the flyout is
+         * shown while win32u's caption is still there and the application
+         * clears it afterwards with SetWindowLongW, which sends no
+         * WM_WINDOWPOSCHANGED -- the decision is never taken again. */
+        if (flyout)
+        {
+            managed = FALSE;
+            owner = win_owner;
+        }
+        else if ((style & WS_CAPTION) != WS_CAPTION && !(ex_style & WS_EX_APPWINDOW) &&
+                 !(floating_palettes_enabled() && (style & WS_THICKFRAME)))
+            managed = FALSE;
+    }
     /* An unowned caption-less popup shown over the application's own window (a
      * notification bubble) is a separate, unowned window on Windows, but it is
      * drawn over the application and the user never manages it.  As a toplevel
