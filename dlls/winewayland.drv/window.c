@@ -181,6 +181,21 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
+/* TRUE if hwnd sits inside ancestor in Win32's own hierarchy, i.e. its parent
+ * chain reaches ancestor.  Win32 clips such a child to the parent's client
+ * area, exactly as a subsurface is clipped to its parent's surface, so the
+ * clipping is the intended behaviour however far the child's rect reaches. */
+static BOOL is_descendant_of(HWND hwnd, HWND ancestor)
+{
+    HWND parent;
+
+    for (parent = NtUserGetAncestor(hwnd, GA_PARENT);
+         parent && parent != NtUserGetDesktopWindow();
+         parent = NtUserGetAncestor(parent, GA_PARENT))
+        if (parent == ancestor) return TRUE;
+    return FALSE;
+}
+
 static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
 {
     struct wayland_surface *surface;
@@ -197,7 +212,24 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     /* A managed window gets its own toplevel, and its owner (if any) becomes
      * the toplevel's parent; an unmanaged one is drawn as part of its owner. */
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
-    else if (owner_surface && !data->managed) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    else if (owner_surface && !data->managed)
+    {
+        /* Drawn as part of the owner while it fits in it. A subsurface is
+         * clipped to its parent's surface, so a window that overhangs it -- a
+         * combo dropdown opening past the bottom of its dialog, a bubble
+         * hanging over the edge of the application -- cannot be one: it gets
+         * an xdg_popup, which the compositor positions relative to the owner
+         * but does not clip to it.  A window Win32 itself clips to the owner
+         * (a real child, whose parent chain reaches it) must not escape that
+         * clip, so it keeps the subsurface role however far its rect reaches. */
+        const RECT *o = &owner_surface->window.rect, *r = &data->rects.window;
+        BOOL fits = r->left >= o->left && r->top >= o->top &&
+                    r->right <= o->right && r->bottom <= o->bottom;
+        BOOL clipped = is_descendant_of(data->hwnd, owner_surface->hwnd);
+        role = (fits || clipped) ? WAYLAND_SURFACE_ROLE_SUBSURFACE : WAYLAND_SURFACE_ROLE_POPUP;
+        TRACE("hwnd=%p fits=%u child=%u role=%s\n", data->hwnd, fits, clipped,
+              role == WAYLAND_SURFACE_ROLE_POPUP ? "popup" : "subsurface");
+    }
     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
 
     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
@@ -239,6 +271,10 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, owner_surface);
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        if (!wayland_surface_make_popup(surface, owner_surface, &data->rects.window))
+            role = WAYLAND_SURFACE_ROLE_NONE;
         break;
     }
 
@@ -328,6 +364,13 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
          * position to the compositor until the next paint: apply it now. */
         if (data->window_contents) wayland_surface_reconfigure(surface);
         break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        /* Unlike a subsurface, a popup has a real xdg_surface configure, whose
+         * serial has to be acknowledged before contents may be committed.  Do
+         * not invent one: reconfigure_popup waits for the compositor's. */
+        TRACE("hwnd=%p popup owner=%p\n", surface->hwnd, surface->owner_hwnd);
+        if (data->window_contents) wayland_surface_reconfigure(surface);
+        break;
     }
 
     wl_display_flush(process_wayland.wl_display);
@@ -357,11 +400,28 @@ static HWND *build_hwnd_list(void)
     }
 }
 
-/* The last window this process mapped as a managed toplevel.  An unowned
- * notification bubble has no Win32 owner to hang on, so the window it is
- * being shown over -- the application's own toplevel -- is the only surface
- * owner there is. */
-static HWND last_managed_toplevel;
+/* Does rect lie inside owner's window rect?
+ *
+ * A wayland subsurface is clipped to its parent's surface, and its parent's
+ * input region does not extend past that surface either: every pixel of a
+ * popup that leaves its owner's rect is lost, both to drawing and to the
+ * pointer.  Windows draws such a popup over the desktop instead (a combo
+ * dropdown that opens past the bottom of its dialog, a menu that opens past
+ * the edge of its window), so a popup that does not fit cannot be drawn as
+ * part of its owner at all. */
+static BOOL rect_fits_owner(HWND owner, const RECT *rect)
+{
+    struct wayland_win_data *data;
+    RECT owner_rect;
+    BOOL ok;
+
+    if (!owner || !(data = wayland_win_data_get(owner))) return FALSE;
+    owner_rect = data->rects.window;
+    wayland_win_data_release(data);
+    ok = rect->left >= owner_rect.left && rect->top >= owner_rect.top &&
+         rect->right <= owner_rect.right && rect->bottom <= owner_rect.bottom;
+    return ok;
+}
 
 /* Is hwnd drawn inside anchor's window rect, smaller than half of it in both
  * directions?  A subsurface cannot exceed its parent's surface and the
@@ -387,6 +447,69 @@ static BOOL anchor_contains(HWND hwnd, HWND anchor, const RECT *rect)
     return ok;
 }
 
+/* Is hwnd a toplevel this driver owns a surface for?  win32u's owner hint is
+ * a WindowFromPoint() on the whole Wine desktop, so it can name another
+ * process's window; that HWND is not in this driver's win_data and cannot be
+ * used as a parent. */
+static BOOL is_local_toplevel(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    BOOL ret;
+
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    ret = data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface);
+    wayland_win_data_release(data);
+    return ret;
+}
+
+/* Fallback for a popup whose own corner names no window of this process:
+ * return the toplevel whose rect it overlaps, or 0.
+ *
+ * This is *not* the primary rule.  A popup's position is honoured exactly, but
+ * relative to its parent surface, while a toplevel's Win32 rect is not its
+ * screen rect: the compositor places a toplevel where it likes and never tells
+ * the client (a dialog whose Win32 rect is (354,280) sat at (3158,403) on the
+ * output).  Anchoring the popup to a toplevel it merely overlaps in Win32
+ * coordinates therefore moves the popup by that toplevel's displacement: the
+ * combo dropdown measured 186 px below its combo (2026-10-18).  Prefer the
+ * point hint; see WAYLAND_WindowPosChanged.
+ *
+ * With `contained`, also require the popup to lie inside the toplevel and be
+ * smaller than it: that is the test for an unowned caption-less popup that the
+ * application draws over its own window (a notification bubble). */
+static HWND popup_owner_toplevel(HWND hwnd, const RECT *rect, BOOL contained)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    HWND *list, ret = 0;
+    RECT r;
+    UINT i;
+
+    if (!(list = build_hwnd_list())) return 0;
+
+    /* top-most first */
+    for (i = 0; list[i] != HWND_BOTTOM && !ret; i++)
+    {
+        if (list[i] == hwnd || !(data = wayland_win_data_get(list[i]))) continue;
+        surface = data->wayland_surface;
+        r = data->rects.window;
+        if (surface && wayland_surface_is_toplevel(surface) && (surface->style & WS_VISIBLE))
+        {
+            if (contained)
+            {
+                if (anchor_contains(hwnd, list[i], rect)) ret = list[i];
+            }
+            else if (r.left < rect->right && rect->left < r.right &&
+                     r.top < rect->bottom && rect->top < r.bottom)
+                ret = list[i];
+        }
+        wayland_win_data_release(data);
+    }
+
+    free(list);
+    return ret;
+}
+
 /* Returns the toplevel an unowned caption-less popup belongs to, or 0.
  *
  * Only a popup that is visibly smaller than that toplevel *and* drawn within
@@ -406,8 +529,8 @@ static HWND popup_anchor(HWND hwnd, const RECT *rect)
         const char *env = getenv("WINEWAYLAND_POPUP_ANCHOR");
         enabled = !(env && *env == '0');
     }
-    if (!enabled || !last_managed_toplevel) return 0;
-    return anchor_contains(hwnd, last_managed_toplevel, rect) ? last_managed_toplevel : 0;
+    if (!enabled) return 0;
+    return popup_owner_toplevel(hwnd, rect, TRUE);
 }
 
 /* An unowned window that carries WS_CAPTION but has no caption text, and that
@@ -578,7 +701,6 @@ void WAYLAND_DestroyWindow(HWND hwnd)
 
     detach_subsurfaces(hwnd);
     if (!(data = wayland_win_data_get(hwnd))) return;
-    if (hwnd == last_managed_toplevel) last_managed_toplevel = 0;
     wayland_win_data_destroy(data);
 }
 
@@ -636,7 +758,13 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * takes a tile from the application and is decorated.  A floating
      * palette is *titled* (the Layer palette's window text is "Layer"), and
      * the sign-in dialog is titled too ("Profile MFE") and far larger, so
-     * existence of a title, plus containment, tells them apart. */
+     * existence of a title, plus containment, tells them apart.
+     *
+     * Being part of the owner is only possible while the popup's rect fits in
+     * it: a subsurface is clipped to its parent's surface, so a combo
+     * dropdown that opens past the bottom of its dialog would lose every item
+     * below that edge.  Such a popup keeps a surface of its own, exactly as
+     * an overhanging bubble does (see popup_anchor). */
     if (managed && win_owner && !fullscreen)
     {
         DWORD ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
@@ -655,7 +783,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             owner = win_owner;
         }
         else if ((style & WS_CAPTION) != WS_CAPTION && !(ex_style & WS_EX_APPWINDOW) &&
-                 !(floating_palettes_enabled() && (style & WS_THICKFRAME)))
+                 !(floating_palettes_enabled() && (style & WS_THICKFRAME)) &&
+                 rect_fits_owner(win_owner, &new_rects->window))
             managed = FALSE;
     }
     /* An unowned caption-less popup shown over the application's own window (a
@@ -688,7 +817,36 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             managed = FALSE;
         }
     }
-    else if (!managed && surface) owner = owner_hint ? owner_hint : win_owner;
+    else if (!managed && surface)
+    {
+        /* A real Win32 child is drawn inside its parent chain: `owner` is its
+         * toplevel ancestor, and Win32 clips it to every ancestor, so no
+         * z-order search may override that.  Otherwise (a child reparented to
+         * the desktop -- user32 does that with the ComboLBox of every dropdown
+         * -- or an unowned popup) the owner has to be the toplevel whose
+         * surface the window's position is expressed against.
+         *
+         * Wayland does not let a client position a toplevel and does not tell
+         * it where the compositor put one, so a window's Win32 rect is *not*
+         * its screen rect: a dialog the application placed at (354,280) can
+         * sit anywhere on the output.  A popup's position, on the other hand,
+         * is honoured exactly -- relative to its parent surface.  Attaching
+         * the popup to whatever toplevel merely overlaps its Win32 rect (the
+         * old z-order search) therefore put the list on the dialog's surface
+         * and moved it by however far the compositor had moved the dialog:
+         * measured as a 186 px displacement of a combo dropdown (2026-10-18).
+         * Anchor to win32u's hint -- the toplevel under the popup's own
+         * corner, which is the window the popup was reparented from -- and
+         * fall back to the overlap search only when that corner names no
+         * window of this process. */
+        if (owner == hwnd)
+        {
+            if (!owner_hint || !is_local_toplevel(owner_hint))
+                owner = popup_owner_toplevel(hwnd, &new_rects->window, FALSE);
+            else
+                owner = owner_hint;
+        }
+    }
     else if (managed && win_owner) owner = win_owner;
 
     TRACE("hwnd %p style %#x owner %p managed %d surface owner %p\n", hwnd, (UINT)style, win_owner, managed, owner);
@@ -776,8 +934,6 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->is_fullscreen = fullscreen;
     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
     data->managed = managed;
-    if (managed && data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface))
-        last_managed_toplevel = hwnd;
 
 
     if (!surface)

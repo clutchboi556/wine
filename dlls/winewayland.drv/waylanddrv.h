@@ -86,6 +86,7 @@ enum wayland_surface_role
     WAYLAND_SURFACE_ROLE_NONE,
     WAYLAND_SURFACE_ROLE_TOPLEVEL,
     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+    WAYLAND_SURFACE_ROLE_POPUP,
 };
 
 struct wayland_keyboard
@@ -310,18 +311,28 @@ struct wayland_surface
     struct wayland_shm_buffer *big_icon_buffer;
 
     enum wayland_surface_role role;
+    /* Created for the toplevel and popup roles alike, before the role object. */
+    struct xdg_surface *xdg_surface;
+    /* For the subsurface and popup roles: the window the surface hangs on. */
+    HWND owner_hwnd;
     union
     {
         struct
         {
-            struct xdg_surface *xdg_surface;
             struct xdg_toplevel *xdg_toplevel;
             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
         };
         struct
         {
+            struct xdg_popup *xdg_popup;
+            /* The anchor (logical coordinates inside the owner's surface) the
+             * popup was created with: xdg_popup cannot be repositioned, so a
+             * different anchor means a new popup object. */
+            RECT popup_anchor;
+        };
+        struct
+        {
             struct wl_subsurface *wl_subsurface;
-            HWND owner_hwnd;
             BOOL placed;            /* stacked among its siblings once, on creation */
         };
     };
@@ -378,6 +389,11 @@ void wayland_surface_destroy(struct wayland_surface *surface);
 void wayland_surface_make_toplevel(struct wayland_surface *surface);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
+/* Popup role: an unmanaged window that does not fit in its owner's surface.
+ * The window rect is in screen coordinates; the anchor the compositor sees is
+ * relative to the owner's surface. */
+BOOL wayland_surface_make_popup(struct wayland_surface *surface, struct wayland_surface *owner,
+                                const RECT *window_rect);
 void wayland_surface_clear_role(struct wayland_surface *surface);
 void wayland_surface_unmap(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
@@ -400,6 +416,21 @@ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UI
 static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
 {
     return surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->xdg_toplevel;
+}
+
+static inline BOOL wayland_surface_is_popup(struct wayland_surface *surface)
+{
+    return surface->role == WAYLAND_SURFACE_ROLE_POPUP && surface->xdg_popup;
+}
+
+/* Toplevel and popup roles both hang a wl_surface on an xdg_surface, and share
+ * the configure/acknowledge dance. */
+static inline BOOL wayland_surface_has_xdg_surface(struct wayland_surface *surface)
+{
+    return surface->xdg_surface && (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL
+                                    ? surface->xdg_toplevel != NULL
+                                    : surface->role == WAYLAND_SURFACE_ROLE_POPUP
+                                      ? surface->xdg_popup != NULL : FALSE);
 }
 
 /**********************************************************************
