@@ -878,33 +878,42 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
  * Reconfigures the xdg surface as needed to match the latest requested
  * state.
  */
-static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, RECT rect)
+static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, RECT rect,
+                                            BOOL *acked)
 {
     struct wayland_window_config *window = &surface->window;
+    enum wayland_surface_config_state state = window->state;
+
+    /* A compositor-maximized window (Hyprland reports every tiled window as
+     * maximized) keeps WS_MAXIMIZE off, and so window->state lacks the
+     * MAXIMIZED bit.  Its configures are still ours to acknowledge: they carry
+     * the size the tile has, and leaving them unacknowledged wedges the
+     * surface at its old size. */
+    if (surface->compositor_maximized)
+        state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
 
     /* Acknowledge any compatible processed config. */
     if (surface->processing.serial && surface->processing.processed &&
-        wayland_surface_config_is_compatible(&surface->processing, rect,
-                                             window->state))
+        wayland_surface_config_is_compatible(&surface->processing, rect, state))
     {
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        *acked = TRUE;
     }
     /* If this is the initial configure, and we have a compatible requested
      * config, use that, in order to draw windows that don't go through the
      * message loop (e.g., some splash screens). */
     else if (!surface->current.serial && surface->requested.serial &&
-             wayland_surface_config_is_compatible(&surface->requested, rect,
-                                                  window->state))
+             wayland_surface_config_is_compatible(&surface->requested, rect, state))
     {
         surface->current = surface->requested;
         memset(&surface->requested, 0, sizeof(surface->requested));
         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        *acked = TRUE;
     }
     else if (!surface->current.serial ||
-             !wayland_surface_config_is_compatible(&surface->current, rect,
-                                                   window->state))
+             !wayland_surface_config_is_compatible(&surface->current, rect, state))
     {
         return FALSE;
     }
@@ -1154,6 +1163,7 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
 {
     struct wayland_window_config *window = &surface->window;
     RECT rect = map_rect_to_surface(surface, surface->window.rect);
+    BOOL acked = FALSE;
 
     TRACE("hwnd=%p window=%s,%#x processing=%s,%#x current=%s,%#x\n",
           surface->hwnd, wine_dbgstr_rect(&rect), window->state,
@@ -1166,7 +1176,7 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
-        if (!wayland_surface_reconfigure_xdg(surface, rect)) return FALSE;
+        if (!wayland_surface_reconfigure_xdg(surface, rect, &acked)) return FALSE;
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         if (!surface->wl_subsurface) break; /* surface role has been cleared */
@@ -1178,6 +1188,13 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     }
 
     wayland_surface_reconfigure_size(surface, rect.right - rect.left, rect.bottom - rect.top);
+
+    /* The acknowledged configure, the geometry and the viewport destination
+     * all take effect only on a commit.  A window whose client area is a GL or
+     * Vulkan subsurface never presents into its toplevel surface, so without
+     * this the compositor keeps the old size and a repaint can never happen:
+     * resize or maximize leaves the contents frozen at the old size. */
+    if (acked) wl_surface_commit(surface->wl_surface);
 
     return TRUE;
 }
