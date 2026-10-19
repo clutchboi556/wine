@@ -24,6 +24,7 @@
 #endif
 
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -50,7 +51,33 @@ static struct list dce_list = LIST_INIT(dce_list);
 #define DCE_CACHE_SIZE 64
 
 static struct list window_surfaces = LIST_INIT( window_surfaces );
-static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t surfaces_lock;
+static pthread_once_t surfaces_lock_once = PTHREAD_ONCE_INIT;
+
+static void init_surfaces_lock( void )
+{
+    pthread_mutexattr_t attr;
+
+    pthread_mutexattr_init( &attr );
+    pthread_mutexattr_setrobust( &attr, PTHREAD_MUTEX_ROBUST );
+    pthread_mutex_init( &surfaces_lock, &attr );
+    pthread_mutexattr_destroy( &attr );
+}
+
+/* NtTerminateThread() kills a thread with a signal, wherever it is: a thread
+ * killed inside one of these critical sections leaves the mutex held forever.
+ * A robust mutex turns that into EOWNERDEAD for the next caller instead of a
+ * deadlocked prefix.  The list only ever loses or duplicates an entry if the
+ * owner died between two list updates, so recovery is safe. */
+static void lock_surfaces( void )
+{
+    pthread_once( &surfaces_lock_once, init_surfaces_lock );
+    if (pthread_mutex_lock( &surfaces_lock ) == EOWNERDEAD)
+    {
+        ERR( "surfaces_lock was abandoned by a terminated thread, recovering\n" );
+        pthread_mutex_consistent( &surfaces_lock );
+    }
+}
 
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
@@ -884,6 +911,7 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
                                               const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
 {
     struct window_surface *surface;
+    pthread_mutexattr_t attr;
 
     if (!(surface = calloc( 1, funcs->size ))) return NULL;
     surface->funcs = funcs;
@@ -902,7 +930,10 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
         return NULL;
     }
 
-    pthread_mutex_init( &surface->mutex, NULL );
+    pthread_mutexattr_init( &attr );
+    pthread_mutexattr_setrobust( &attr, PTHREAD_MUTEX_ROBUST );
+    pthread_mutex_init( &surface->mutex, &attr );
+    pthread_mutexattr_destroy( &attr );
 
     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
@@ -932,7 +963,11 @@ void window_surface_release( struct window_surface *surface )
 void window_surface_lock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
-    pthread_mutex_lock( &surface->mutex );
+    if (pthread_mutex_lock( &surface->mutex ) == EOWNERDEAD)
+    {
+        ERR( "surface %p was abandoned by a terminated thread, recovering\n", surface );
+        pthread_mutex_consistent( &surface->mutex );
+    }
 }
 
 void window_surface_unlock( struct window_surface *surface )
@@ -1242,7 +1277,7 @@ void register_window_surface( struct window_surface *old, struct window_surface 
     if (old == &dummy_surface) old = NULL;
     if (new == &dummy_surface) new = NULL;
     if (old == new) return;
-    pthread_mutex_lock( &surfaces_lock );
+    lock_surfaces();
     if (old) list_remove( &old->entry );
     if (new) list_add_tail( &window_surfaces, &new->entry );
     pthread_mutex_unlock( &surfaces_lock );
@@ -1256,19 +1291,52 @@ void register_window_surface( struct window_surface *old, struct window_surface 
 void flush_window_surfaces( BOOL idle )
 {
     static DWORD last_idle;
-    DWORD now;
     struct window_surface *surface;
+    struct window_surface **snapshot = NULL, **new_snapshot;
+    SIZE_T count = 0, capacity = 0, i;
+    DWORD now;
 
-    pthread_mutex_lock( &surfaces_lock );
+    /* window_surface_flush() runs the driver's flush, which can block for an
+     * unbounded time: the Wayland driver waits for the compositor to release a
+     * buffer.  Holding surfaces_lock across that made the stall global -- every
+     * other thread that painted (NtUserEndPaint flushes) or moved a window waited
+     * for this lock behind it, so one stuck surface froze the whole prefix.  Take
+     * the references under the lock and flush without it: the per-surface mutex in
+     * window_surface_flush() is what serializes concurrent flushes of one surface. */
+    lock_surfaces();
     now = NtGetTickCount();
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
     else if ((int)(now - last_idle) < 50) goto done;
 
     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
-        window_surface_flush( surface );
+    {
+        if (count == capacity)
+        {
+            SIZE_T new_capacity = capacity ? capacity * 2 : 16;
+
+            if (!(new_snapshot = realloc( snapshot, new_capacity * sizeof(*snapshot) ))) break;
+            snapshot = new_snapshot;
+            capacity = new_capacity;
+        }
+        window_surface_add_ref( surface );
+        snapshot[count++] = surface;
+    }
 done:
     pthread_mutex_unlock( &surfaces_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        DWORD start = NtGetTickCount(), elapsed;
+
+        window_surface_flush( snapshot[i] );
+        elapsed = NtGetTickCount() - start;
+        if (elapsed >= 1000)
+            ERR( "flush of surface %p hwnd %p in thread %04x took %u ms\n", snapshot[i],
+                 snapshot[i]->hwnd, GetCurrentThreadId(), elapsed );
+        window_surface_release( snapshot[i] );
+    }
+    free( snapshot );
 }
 
 /***********************************************************************
