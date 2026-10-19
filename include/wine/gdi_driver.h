@@ -271,6 +271,7 @@ struct client_surface
     LONG                               offscreen;      /* client window is offscreen */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
+    BOOL                               visible;        /* the window has visible pixels after Win32 clipping */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 

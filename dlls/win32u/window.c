@@ -357,6 +357,35 @@ static RECT get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *monitor_re
     return rect;
 }
 
+/* Whether Win32 clipping leaves the window without any visible pixels: hidden
+ * ancestors, ancestor client clipping, and sibling windows covering it are all
+ * accounted for.  Host client surfaces are drawn above all of their toplevel's
+ * Win32 content, so they must be detached when the window is fully clipped. */
+static BOOL is_window_fully_clipped( HWND hwnd )
+{
+    RECT rect;
+    NTSTATUS status;
+    BOOL empty = FALSE;
+
+    SERVER_START_REQ( get_visible_region )
+    {
+        req->window = wine_server_user_handle( hwnd );
+        req->flags = DCX_CLIPSIBLINGS;
+        wine_server_set_reply( req, &rect, sizeof(rect) );
+        status = wine_server_call( req );
+        /* Empty regions are reported as a single zero-area rectangle. */
+        TRACE( "hwnd %p status %#x reply_size %u\n", hwnd, (unsigned int)status, (unsigned int)wine_server_reply_size( reply ) );
+        if (!status && wine_server_reply_size( reply ) >= sizeof(rect))
+        {
+            TRACE( "hwnd %p first rect %s\n", hwnd, wine_dbgstr_rect( &rect ) );
+            empty = rect.right <= rect.left || rect.bottom <= rect.top;
+        }
+    }
+    SERVER_END_REQ;
+
+    return empty;
+}
+
 static void client_surface_update_locked( struct client_surface *surface )
 {
     RECT virtual_rect = surface->virtual_rect, monitor_rect = surface->monitor_rect;
@@ -383,7 +412,12 @@ void update_client_surfaces( HWND hwnd )
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
     {
+        BOOL visible;
+
         if (NtUserGetAncestor( surface->hwnd, GA_ROOT ) != hwnd) continue;
+        visible = !is_window_fully_clipped( surface->hwnd );
+        if (visible != surface->visible) TRACE( "hwnd %p visible %u\n", surface->hwnd, visible );
+        surface->visible = visible;
         client_surface_update_locked( surface );
     }
 
@@ -407,10 +441,11 @@ void *client_surface_create( const struct client_surface_funcs *funcs, HWND hwnd
     surface->raw = raw;
     surface->toplevel = toplevel;
     surface->virtual_rect = get_client_surface_rects( toplevel, hwnd, &surface->monitor_rect );
+    surface->visible = !is_window_fully_clipped( hwnd );
     list_init( &surface->entry );
 
-    TRACE( "created %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
-           format, raw, toplevel, wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
+    TRACE( "created %s, format %d, raw %u, toplevel %p, visible %u, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
+           format, raw, toplevel, surface->visible, wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
     return surface;
 }
 
