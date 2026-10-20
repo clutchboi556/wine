@@ -1820,9 +1820,21 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
     /* Update the latest window buffer for the wayland surface. Note that we
      * only care whether the buffer contains the latest window contents,
      * it's irrelevant if it was actually committed or not. */
-    if (data->window_contents)
-        wayland_shm_buffer_unref(data->window_contents);
-    wayland_shm_buffer_ref((data->window_contents = shm_buffer));
+    if (data->window_contents != shm_buffer)
+    {
+        /* Reference the new buffer before dropping the old one, and never
+         * drop-and-retake a buffer that is already published.  A flush
+         * normally re-publishes the buffer it just drew into, and once the
+         * buffer queue that created it has been recreated (format change),
+         * the contents reference can be the last one left: dropping it first
+         * destroyed and unmapped a buffer that stayed published as the window
+         * contents, and every later flush copied pixels into a dead mapping
+         * and raised an exception (measured 2026-10-20: 65437 leaked damage
+         * regions then an exhausted GDI handle table). */
+        wayland_shm_buffer_ref(shm_buffer);
+        if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
+        data->window_contents = shm_buffer;
+    }
 
     wayland_win_data_release(data);
 
