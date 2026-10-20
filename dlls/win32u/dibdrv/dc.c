@@ -503,8 +503,34 @@ struct windrv_physdev
     struct gdi_physdev     dev;
     struct dibdrv_physdev *dibdrv;
     struct window_surface *surface;
-    UINT lock_count;
 };
+
+/* A drawing operation locks the surface behind the DC it was given, and the DC
+ * can be retargeted to another surface while the operation runs: clipping and
+ * window updates call dibdrv_set_window_surface() from whichever thread paints,
+ * and cached window DCs are shared between threads.  Record the surface that
+ * was actually locked, per thread, and unlock that one; deciding from the DC's
+ * current surface skipped an unlock whenever the pointer changed meanwhile and
+ * left the old surface locked by this thread.  The depth is per thread for the
+ * same reason: a count shared by two threads drawing through one DC neither
+ * nests for the one nor balances for the other. */
+#define MAX_WINDRV_LOCKS 8
+
+static __thread struct
+{
+    struct windrv_physdev *dev;
+    struct window_surface *surface;
+    UINT depth;
+} windrv_locks[MAX_WINDRV_LOCKS];
+
+static UINT find_windrv_lock( struct windrv_physdev *dev )
+{
+    UINT i;
+
+    for (i = 0; i < MAX_WINDRV_LOCKS; i++)
+        if (windrv_locks[i].dev == dev) return i;
+    return MAX_WINDRV_LOCKS;
+}
 
 static const struct gdi_dc_funcs window_driver;
 
@@ -517,38 +543,62 @@ static inline struct windrv_physdev *get_windrv_physdev( PHYSDEV dev )
 static inline void lock_surface( struct windrv_physdev *dev )
 {
     struct window_surface *surface = dev->surface;
+    UINT i;
 
-    if (!dev->lock_count++)
+    if ((i = find_windrv_lock( dev )) < MAX_WINDRV_LOCKS)
     {
-        window_surface_lock( surface );
-        if (IsRectEmpty( dev->dibdrv->bounds ) || !surface->draw_start_ticks)
-            surface->draw_start_ticks = NtGetTickCount();
+        windrv_locks[i].depth++;
+        return;
     }
+
+    for (i = 0; i < MAX_WINDRV_LOCKS; i++)
+    {
+        if (windrv_locks[i].dev) continue;
+        windrv_locks[i].dev = dev;
+        windrv_locks[i].surface = surface;
+        windrv_locks[i].depth = 1;
+        break;
+    }
+    if (i == MAX_WINDRV_LOCKS)
+        ERR( "thread holds more than %u window DC surfaces, %p is not tracked\n", MAX_WINDRV_LOCKS, dev );
+
+    window_surface_lock( surface );
+    if (IsRectEmpty( dev->dibdrv->bounds ) || !surface->draw_start_ticks)
+        surface->draw_start_ticks = NtGetTickCount();
 }
 
 static inline void unlock_surface( struct windrv_physdev *dev )
 {
-    struct window_surface *surface = dev->surface;
+    struct window_surface *surface;
+    DWORD ticks;
+    UINT i;
 
-    if (!--dev->lock_count)
+    if ((i = find_windrv_lock( dev )) < MAX_WINDRV_LOCKS)
     {
-        DWORD ticks = NtGetTickCount() - surface->draw_start_ticks;
-        window_surface_unlock( surface );
-        if (ticks > FLUSH_PERIOD) window_surface_flush( dev->surface );
+        if (--windrv_locks[i].depth) return;
+        surface = windrv_locks[i].surface;
+        windrv_locks[i].dev = NULL;
     }
+    else
+    {
+        ERR( "window DC surface %p unlocked without a matching lock\n", dev );
+        surface = dev->surface;
+    }
+
+    ticks = NtGetTickCount() - surface->draw_start_ticks;
+    window_surface_unlock( surface );
+    if (ticks > FLUSH_PERIOD) window_surface_flush( surface );
 }
 
 static inline void lock_surfaces( struct windrv_physdev *dst_dev, struct windrv_physdev *src_dev )
 {
     lock_surface( dst_dev );
-    if (src_dev && !src_dev->lock_count++ && dst_dev->surface != src_dev->surface)
-        window_surface_lock( src_dev->surface );
+    if (src_dev) lock_surface( src_dev );
 }
 
 static inline void unlock_surfaces( struct windrv_physdev *dst_dev, struct windrv_physdev *src_dev )
 {
-    if (src_dev && !--src_dev->lock_count && dst_dev->surface != src_dev->surface)
-        window_surface_unlock( src_dev->surface );
+    if (src_dev) unlock_surface( src_dev );
     unlock_surface( dst_dev );
 }
 

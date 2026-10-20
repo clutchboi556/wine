@@ -79,6 +79,31 @@ static void lock_surfaces( void )
     }
 }
 
+/* The surface mutex is taken around every driver flush and every dibdrv drawing
+ * operation.  It is a robust mutex of the normal kind, and glibc does not treat
+ * a recursive acquisition of those as an error: the owner blocks in futex_wait
+ * on its own mutex forever, with its own tid left in the lock word, so neither
+ * owner death nor a waiter can ever release it.  That is how acad.exe froze: a
+ * paint thread held a surface whose matching unlock had been skipped, then
+ * flushed it again.  Track the depth per thread, so a repeated lock does not
+ * wait, and report the surface that was released without being unlocked. */
+#define MAX_SURFACE_LOCKS 8
+
+static __thread struct
+{
+    struct window_surface *surface;
+    unsigned int depth;
+} held_surfaces[MAX_SURFACE_LOCKS];
+
+static unsigned int find_held_surface( struct window_surface *surface )
+{
+    unsigned int i;
+
+    for (i = 0; i < MAX_SURFACE_LOCKS; i++)
+        if (held_surfaces[i].surface == surface) return i;
+    return MAX_SURFACE_LOCKS;
+}
+
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
  */
@@ -951,6 +976,15 @@ void window_surface_release( struct window_surface *surface )
     ULONG ret = InterlockedDecrement( &surface->ref );
     if (!ret)
     {
+        unsigned int i;
+
+        if ((i = find_held_surface( surface )) < MAX_SURFACE_LOCKS)
+        {
+            ERR( "surface %p hwnd %p was freed while its lock was held, depth %u\n",
+                 surface, surface->hwnd, held_surfaces[i].depth );
+            held_surfaces[i].surface = NULL;
+            held_surfaces[i].depth = 0;
+        }
         if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
@@ -962,18 +996,52 @@ void window_surface_release( struct window_surface *surface )
 
 void window_surface_lock( struct window_surface *surface )
 {
+    unsigned int i;
+
     if (surface == &dummy_surface) return;
+
+    if ((i = find_held_surface( surface )) < MAX_SURFACE_LOCKS)
+    {
+        /* Same thread taking a surface it already holds.  Waiting here would
+         * never return: only the owner could unlock, and it is the one waiting. */
+        held_surfaces[i].depth++;
+        WARN( "surface %p hwnd %p locked again by its owner, depth %u\n",
+              surface, surface->hwnd, held_surfaces[i].depth );
+        return;
+    }
+
     if (pthread_mutex_lock( &surface->mutex ) == EOWNERDEAD)
     {
         ERR( "surface %p was abandoned by a terminated thread, recovering\n", surface );
         pthread_mutex_consistent( &surface->mutex );
     }
+
+    for (i = 0; i < MAX_SURFACE_LOCKS; i++)
+    {
+        if (held_surfaces[i].surface) continue;
+        held_surfaces[i].surface = surface;
+        held_surfaces[i].depth = 1;
+        return;
+    }
+    ERR( "thread holds more than %u window surfaces, %p hwnd %p is not tracked\n",
+         MAX_SURFACE_LOCKS, surface, surface->hwnd );
 }
 
 void window_surface_unlock( struct window_surface *surface )
 {
+    unsigned int i;
+
     if (surface == &dummy_surface) return;
-    pthread_mutex_unlock( &surface->mutex );
+
+    if ((i = find_held_surface( surface )) < MAX_SURFACE_LOCKS)
+    {
+        if (--held_surfaces[i].depth) return;
+        held_surfaces[i].surface = NULL;
+    }
+    else ERR( "surface %p hwnd %p unlocked by a thread that does not hold it\n", surface, surface->hwnd );
+
+    if (pthread_mutex_unlock( &surface->mutex ) && errno == EPERM)
+        ERR( "surface %p hwnd %p is not owned by the unlocking thread\n", surface, surface->hwnd );
 }
 
 static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child );
