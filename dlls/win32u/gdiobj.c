@@ -730,9 +730,20 @@ HGDIOBJ alloc_gdi_handle( struct gdi_obj_header *obj, DWORD type, const struct g
         entry = next_unused++;
     else
     {
+        /* Once the handle table is full every further allocation fails, and
+         * every failure used to print the 65536-object dump when +gdi was on:
+         * that amplifier turned one 5-minute run into a 171 GB log
+         * (2026-10-20).  Report the first failure in full, then rarely. */
+        static LONG full_count;
+        LONG n = InterlockedIncrement( &full_count );
+
         pthread_mutex_unlock( &gdi_lock );
-        ERR( "out of GDI object handles, expect a crash\n" );
-        if (TRACE_ON(gdi)) dump_gdi_objects();
+        if (n == 1)
+        {
+            ERR( "out of GDI object handles, expect a crash\n" );
+            if (TRACE_ON(gdi)) dump_gdi_objects();
+        }
+        else if (!(n % 100000)) ERR( "out of GDI object handles (%ld refused so far)\n", n );
         return 0;
     }
     obj->funcs    = funcs;
