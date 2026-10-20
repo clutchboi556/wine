@@ -128,6 +128,17 @@ err:
     return NULL;
 }
 
+static LONG alloc_err, region_err, copy_region_err, buffer_err;
+/* A flush that fails at the same place fails again on the next window message,
+ * hundreds of times per second, and each report is ~50 bytes in the log: an
+ * exhausted handle table turned one 5-minute run into a 171 GB file
+ * (2026-10-20).  Report the first ones, then once every 100000. */
+static void err_limited(LONG *count, const char *what)
+{
+    LONG n = InterlockedIncrement(count);
+    if (n <= 5 || !(n % 100000)) ERR("%s (%ld times)\n", what, n);
+}
+
 /**********************************************************************
  *          wayland_buffer_queue_get_free_buffer
  *
@@ -177,7 +188,7 @@ static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wa
                  * buffers busy, there is a good chance the compositor will
                  * eventually release one of them, so dispatch events and wait
                  * below. Otherwise, give up and return a NULL buffer. */
-                ERR(" => failed to acquire buffer\n");
+                err_limited(&alloc_err, " => failed to acquire buffer");
                 return NULL;
             }
         }
@@ -402,7 +413,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
                                                rect->left + dirty->right, rect->top + dirty->bottom);
     if (!surface_damage_region)
     {
-        ERR("failed to create surface damage region\n");
+        err_limited(&region_err, "failed to create surface damage region");
         goto done;
     }
 
@@ -452,7 +463,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         shm_buffer = wayland_buffer_queue_get_free_buffer(wws->wayland_buffer_queue);
     if (!shm_buffer)
     {
-        ERR("failed to acquire Wayland SHM buffer, returning\n");
+        err_limited(&buffer_err, "failed to acquire Wayland SHM buffer, returning");
         if (latest_buffer) wayland_shm_buffer_unref(latest_buffer);
         goto done;
     }
@@ -467,7 +478,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
             HRGN copy_from_latest_region = NtGdiCreateRectRgn(0, 0, 0, 0);
             if (!copy_from_latest_region)
             {
-                ERR("failed to create copy_from_latest region\n");
+                err_limited(&copy_region_err, "failed to create copy_from_latest region");
                 goto done;
             }
             NtGdiCombineRgn(copy_from_latest_region, shm_buffer->damage_region,
