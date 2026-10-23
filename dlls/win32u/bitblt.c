@@ -1018,6 +1018,15 @@ BOOL WINAPI NtGdiAlphaBlend( HDC hdcDst, int xDst, int yDst, int widthDst, int h
             RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
             ret = FALSE;
         }
+        else if (blendFunction.BlendOp == AC_SRC_OVER && !blendFunction.BlendFlags &&
+                 blendFunction.SourceConstantAlpha == 255 && !(blendFunction.AlphaFormat & AC_SRC_ALPHA))
+        {
+            /* constant alpha 255 and no source alpha: the blend result is the source
+             * bitmap, so skip the read-modify-write blend and copy it directly */
+            PHYSDEV src_dev = GET_DC_PHYSDEV( dcSrc, pStretchBlt );
+            PHYSDEV dst_dev = GET_DC_PHYSDEV( dcDst, pStretchBlt );
+            ret = dst_dev->funcs->pStretchBlt( dst_dev, &dst, src_dev, &src, SRCCOPY );
+        }
         else if (!ret)
         {
             PHYSDEV src_dev = GET_DC_PHYSDEV( dcSrc, pAlphaBlend );
