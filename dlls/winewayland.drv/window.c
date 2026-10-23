@@ -1668,6 +1668,53 @@ static ULONGLONG monotonic_ms(void)
     return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static ULONGLONG monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ULONGLONG)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+/* WINEWAYLAND_TIME_FLUSH=1: present-path measurement, same gate as
+ * window_surface.c (docs/STATUS.md). */
+static int present_time = -1;
+static ULONGLONG pv_defer, pv_now, pv_expired, pv_drop;
+static ULONGLONG pv_age_ms_sum, pv_age_ms_max;
+static ULONGLONG pv_present_us_sum, pv_present_us_max;
+
+static BOOL present_time_enabled(void)
+{
+    if (present_time < 0) present_time = getenv("WINEWAYLAND_TIME_FLUSH") != NULL;
+    return present_time;
+}
+
+static ULONGLONG present_since_ms(HWND hwnd)
+{
+    struct pending_present *p;
+    ULONGLONG since = 0;
+    pthread_mutex_lock(&pending_mutex);
+    LIST_FOR_EACH_ENTRY(p, &pending_presents, struct pending_present, entry)
+        if (p->hwnd == hwnd) { since = p->since; break; }
+    pthread_mutex_unlock(&pending_mutex);
+    return since;
+}
+
+static void present_time_report(void)
+{
+    ULONGLONG n = pv_defer + pv_now;
+    if (!n) return;
+    fprintf(stderr, "PRESENT now=%llu defer=%llu expired=%llu drop=%llu "
+            "age_ms_mean=%llu age_ms_max=%llu present_us_mean=%llu present_us_max=%llu\n",
+            (unsigned long long)pv_now, (unsigned long long)pv_defer,
+            (unsigned long long)pv_expired, (unsigned long long)pv_drop,
+            (unsigned long long)(pv_expired ? pv_age_ms_sum / pv_expired : 0),
+            (unsigned long long)pv_age_ms_max,
+            (unsigned long long)(pv_expired ? pv_present_us_sum / pv_expired : 0),
+            (unsigned long long)pv_present_us_max);
+    pv_defer = pv_now = pv_expired = pv_drop = 0;
+    pv_age_ms_sum = pv_age_ms_max = pv_present_us_sum = pv_present_us_max = 0;
+}
+
 static void pending_present_add(HWND hwnd)
 {
     struct pending_present *p;
@@ -1707,6 +1754,9 @@ static void present_pending(struct wayland_win_data *data, struct wayland_surfac
 {
     int win_width = surface->window.rect.right - surface->window.rect.left;
     int win_height = surface->window.rect.bottom - surface->window.rect.top;
+    BOOL timing = present_time_enabled();
+    ULONGLONG age = timing ? monotonic_ms() - present_since_ms(data->hwnd) : 0;
+    ULONGLONG t0 = timing ? monotonic_us() : 0;
 
     if (surface->frame_cb)
     {
@@ -1717,8 +1767,11 @@ static void present_pending(struct wayland_win_data *data, struct wayland_surfac
      * presenting it would sample past its end (stripes) - the resize brings
      * new contents anyway */
     if (data->pending_contents->width < win_width || data->pending_contents->height < win_height)
+    {
+        pv_drop++;
         TRACE("hwnd=%p dropping stale %dx%d contents for a %dx%d window\n", data->hwnd,
               data->pending_contents->width, data->pending_contents->height, win_width, win_height);
+    }
     else if (wayland_surface_reconfigure(surface))
     {
         wayland_surface_attach_shm(surface, data->pending_contents, data->pending_damage);
@@ -1730,6 +1783,17 @@ static void present_pending(struct wayland_win_data *data, struct wayland_surfac
     data->pending_contents = NULL;
     NtGdiSetRectRgn(data->pending_damage, 0, 0, 0, 0);
     pending_present_remove(data->hwnd);
+
+    if (timing)
+    {
+        ULONGLONG dur = monotonic_us() - t0;
+        pv_expired++;
+        pv_age_ms_sum += age;
+        if (age > pv_age_ms_max) pv_age_ms_max = age;
+        pv_present_us_sum += dur;
+        if (dur > pv_present_us_max) pv_present_us_max = dur;
+        if (!((pv_defer + pv_now) % 32)) present_time_report();
+    }
 }
 
 /* called by the event loop: present whatever has waited more than a frame */
@@ -1797,6 +1861,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         {
             /* a frame is in flight: present these contents at its callback */
             TRACE("hwnd=%p deferring %p to the frame callback\n", hwnd, shm_buffer);
+            pv_defer++;
             if (data->pending_contents != shm_buffer)
             {
                 if (data->pending_contents) wayland_shm_buffer_unref(data->pending_contents);
@@ -1809,6 +1874,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         }
         else
         {
+            pv_now++;
             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
             wl_surface_commit(wayland_surface->wl_surface);
             request_frame_callback(wayland_surface);

@@ -25,8 +25,10 @@
 #include "config.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "waylanddrv.h"
@@ -54,6 +56,49 @@ static struct wayland_window_surface *wayland_window_surface_cast(
     struct window_surface *window_surface)
 {
     return (struct wayland_window_surface *)window_surface;
+}
+
+/* WINEWAYLAND_TIME_FLUSH=1: temporary measurement of where a flush's time
+ * goes, and of the damage it is handed (docs/STATUS.md).  Reports one line per
+ * 32 flushes on stderr; costs nothing when the variable is unset. */
+static inline ULONGLONG time_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (ULONGLONG)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int time_flush = -1;
+static ULONGLONG fs_n, fs_blocks, fs_block_us, fs_area, fs_rects;
+static ULONGLONG fs_sel, fs_copy, fs_commit, fs_sock, fs_total;
+static ULONGLONG fs_sel_max, fs_copy_max, fs_commit_max, fs_sock_max, fs_total_max;
+
+static BOOL time_flush_enabled(void)
+{
+    if (time_flush < 0) time_flush = getenv("WINEWAYLAND_TIME_FLUSH") != NULL;
+    return time_flush;
+}
+
+static void time_flush_report(void)
+{
+    ULONGLONG n = fs_n;
+    if (!n) return;
+    fprintf(stderr, "FLUSH n=%llu blocks=%llu block_us=%llu "
+            "mean_us sel=%llu copy=%llu commit=%llu sock=%llu total=%llu "
+            "max_us sel=%llu copy=%llu commit=%llu sock=%llu total=%llu "
+            "dirty_area_mean=%llu dirty_rects_mean=%llu\n",
+            (unsigned long long)n, (unsigned long long)fs_blocks,
+            (unsigned long long)fs_block_us,
+            (unsigned long long)(fs_sel / n), (unsigned long long)(fs_copy / n),
+            (unsigned long long)(fs_commit / n), (unsigned long long)(fs_sock / n),
+            (unsigned long long)(fs_total / n),
+            (unsigned long long)fs_sel_max, (unsigned long long)fs_copy_max,
+            (unsigned long long)fs_commit_max, (unsigned long long)fs_sock_max,
+            (unsigned long long)fs_total_max,
+            (unsigned long long)(fs_area / n), (unsigned long long)(fs_rects / n));
+    fs_n = fs_sel = fs_copy = fs_commit = fs_sock = fs_total = 0;
+    fs_sel_max = fs_copy_max = fs_commit_max = fs_sock_max = fs_total_max = 0;
+    fs_area = fs_rects = fs_blocks = fs_block_us = 0;
 }
 
 static void buffer_release(void *data, struct wl_buffer *buffer)
@@ -148,6 +193,15 @@ static void err_limited(LONG *count, const char *what)
 static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wayland_buffer_queue *queue)
 {
     struct wayland_shm_buffer *shm_buffer;
+    static int max_buffers;
+
+    if (!max_buffers)
+    {
+        const char *s = getenv("WINEWAYLAND_BUFFERS");
+        max_buffers = s ? atoi(s) : 3;
+        if (max_buffers < 2) max_buffers = 2;
+        if (max_buffers > 16) max_buffers = 16;
+    }
 
     TRACE("queue=%p\n", queue);
 
@@ -166,8 +220,8 @@ static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wa
             nbuffers++;
         }
 
-        /* Dynamically create up to 3 buffers. */
-        if (nbuffers < 3)
+        /* Dynamically create up to WINEWAYLAND_BUFFERS (default 3) buffers. */
+        if (nbuffers < max_buffers)
         {
             shm_buffer = wayland_shm_buffer_create(queue->width, queue->height,
                                                    queue->format);
@@ -195,8 +249,17 @@ static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wa
 
         /* We don't have any buffers available, so block waiting for a buffer
          * release event. */
-        if (wl_display_dispatch_queue(process_wayland.wl_display,
-                                      queue->wl_event_queue) == -1)
+        if (time_flush_enabled())
+        {
+            ULONGLONG t0 = time_us();
+            int ret = wl_display_dispatch_queue(process_wayland.wl_display,
+                                                queue->wl_event_queue);
+            fs_blocks++;
+            fs_block_us += time_us() - t0;
+            if (ret == -1) return NULL;
+        }
+        else if (wl_display_dispatch_queue(process_wayland.wl_display,
+                                           queue->wl_event_queue) == -1)
         {
             return NULL;
         }
@@ -408,6 +471,10 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     HRGN surface_damage_region = NULL;
     HRGN copy_from_window_region;
     uint32_t buffer_format;
+    BOOL timing = time_flush_enabled();
+    ULONGLONG t0 = 0, t_sel = 0, t_copy = 0, t_commit = 0, t_sock = 0;
+
+    if (timing) t0 = time_us();
 
     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
                                                rect->left + dirty->right, rect->top + dirty->bottom);
@@ -468,6 +535,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         goto done;
     }
 
+    if (timing) t_sel = time_us();
+
     if (latest_buffer)
     {
         TRACE("latest_window_buffer=%p\n", latest_buffer);
@@ -511,10 +580,39 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 
     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
 
+    if (timing) t_copy = time_us();
+
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
 
     flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
+    if (timing) t_commit = time_us();
     wl_display_flush(process_wayland.wl_display);
+    if (timing) t_sock = time_us();
+
+    if (timing && t_sock)
+    {
+        ULONGLONG area = 0, rects = 0;
+        RGNDATA *rd = get_region_data(surface_damage_region);
+        if (rd)
+        {
+            RECT *rgn_rect = (RECT *)rd->Buffer;
+            RECT *rgn_rect_end = rgn_rect + rd->rdh.nCount;
+            rects = rd->rdh.nCount;
+            for (; rgn_rect < rgn_rect_end; rgn_rect++)
+                area += (ULONGLONG)(rgn_rect->right - rgn_rect->left) *
+                        (rgn_rect->bottom - rgn_rect->top);
+            free(rd);
+        }
+        fs_n++;
+        fs_area += area;
+        fs_rects += rects;
+        fs_sel += t_sel - t0;           if (t_sel - t0 > fs_sel_max) fs_sel_max = t_sel - t0;
+        fs_copy += t_copy - t_sel;      if (t_copy - t_sel > fs_copy_max) fs_copy_max = t_copy - t_sel;
+        fs_commit += t_commit - t_copy; if (t_commit - t_copy > fs_commit_max) fs_commit_max = t_commit - t_copy;
+        fs_sock += t_sock - t_commit;   if (t_sock - t_commit > fs_sock_max) fs_sock_max = t_sock - t_commit;
+        fs_total += t_sock - t0;        if (t_sock - t0 > fs_total_max) fs_total_max = t_sock - t0;
+        if (!(fs_n % 32)) time_flush_report();
+    }
 
 done:
     if (surface_damage_region) NtGdiDeleteObjectApp(surface_damage_region);

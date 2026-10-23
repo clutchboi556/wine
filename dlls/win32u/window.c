@@ -2735,6 +2735,20 @@ BOOL WINAPI NtUserSetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alph
     return ret;
 }
 
+static inline ULONGLONG ulw_us(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (ULONGLONG)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int ulw_timing(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv( "WINEWAYLAND_TIME_ULW" ) ? 1 : 0;
+    return v;
+}
+
 /*****************************************************************************
  *           UpdateLayeredWindow (win32u.@)
  */
@@ -2749,6 +2763,10 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
     RECT surface_rect;
     SIZE offset;
     BOOL ret = FALSE;
+    BOOL ulw_t = ulw_timing();
+    ULONGLONG ut0 = 0, ut_apply = 0, ut_pat = 0, ut_blend = 0, ut_lay = 0, ut_upd = 0, ut_flu = 0;
+
+    if (ulw_t) ut0 = ulw_us();
 
     if (flags & ~(ULW_COLORKEY | ULW_ALPHA | ULW_OPAQUE | ULW_EX_NORESIZE) ||
         !(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED) ||
@@ -2799,6 +2817,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
     if (!surface) return FALSE;
+    if (ulw_t) ut_apply = ulw_us();
 
     if (!hdc_src || surface == &dummy_surface || NtUserWindowFromDC( hdc_src ) == hwnd)
     {
@@ -2820,6 +2839,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
 
         if (dirty) intersect_rect( &rect, &rect, dirty );
         NtGdiPatBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, BLACKNESS );
+        if (ulw_t) ut_pat = ulw_us();
 
         src_rect = rect;
         if (pts_src) OffsetRect( &src_rect, pts_src->x, pts_src->y );
@@ -2829,6 +2849,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
                                hdc_src, src_rect.left, src_rect.top, src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
                                *(DWORD *)&src_blend, 0 );
         if (ret) add_bounds_rect( &surface->bounds, &rect );
+        if (ulw_t) ut_blend = ulw_us();
 
         NtGdiDeleteObjectApp( hdc );
         window_surface_unlock( surface );
@@ -2842,9 +2863,23 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
             window_surface_set_layered( surface, key, -1, 0xff000000 );
         else
             window_surface_set_layered( surface, key, 0xff000000, 0 );
+        if (ulw_t) ut_lay = ulw_us();
 
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
+        if (ulw_t) ut_upd = ulw_us();
         window_surface_flush( surface );
+        if (ulw_t) ut_flu = ulw_us();
+
+        if (ulw_t)
+            fprintf( stderr, "ULW hwnd=%p %ldx%ld apply=%llu pat=%llu blend=%llu lay=%llu upd=%llu flush=%llu total=%llu us\n",
+                     hwnd, rect.right - rect.left, rect.bottom - rect.top,
+                     (unsigned long long)(ut_apply - ut0),
+                     (unsigned long long)(ut_pat - ut_apply),
+                     (unsigned long long)(ut_blend - ut_pat),
+                     (unsigned long long)(ut_lay - ut_blend),
+                     (unsigned long long)(ut_upd - ut_lay),
+                     (unsigned long long)(ut_flu - ut_upd),
+                     (unsigned long long)(ut_flu - ut0) );
     }
 
 done:
