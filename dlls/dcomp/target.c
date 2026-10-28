@@ -82,26 +82,11 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
         }
         if (target->shared_visual_handle)
             CloseHandle(target->shared_visual_handle);
+        shared_visual_target_free(target);
         free(target);
     }
 
     return ref;
-}
-
-static void shared_visual_target_set_root(HANDLE shared_visual_handle, IDCompositionVisual *root)
-{
-    NTSTATUS status;
-
-    SERVER_START_REQ(dcomp_set_shared_visual_info)
-    {
-        req->handle = wine_server_obj_handle(shared_visual_handle);
-        req->target_root = wine_server_client_ptr(root);
-        status = wine_server_call(req);
-    }
-    SERVER_END_REQ;
-
-    if (status)
-        ERR("dcomp_set_shared_visual_info failed, not in the same process? status %#lx.\n", status);
 }
 
 static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
@@ -134,9 +119,8 @@ static HRESULT STDMETHODCALLTYPE target_SetRoot(IDCompositionTarget *iface,
         IDCompositionVisual_Release(target->root);
     }
     target->root = visual;
-
     if (target->shared_visual_handle)
-        shared_visual_target_set_root(target->shared_visual_handle, target->root);
+        composite_thread_start(impl_from_IDCompositionDevice(target->device));
 
     dcomp_unlock();
     return S_OK;
@@ -219,5 +203,6 @@ HRESULT create_target_from_shared_visual_handle(struct composition_device *devic
     target->device = &device->IDCompositionDevice_iface;
     target->shared_visual_handle = handle;
     *new_target = &target->IDCompositionTarget_iface;
+    composite_thread_start(device);
     return S_OK;
 }

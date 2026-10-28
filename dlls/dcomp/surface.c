@@ -63,7 +63,8 @@ static ULONG STDMETHODCALLTYPE surface_Release(IDCompositionSurfaceUnknown *ifac
     if (!ref)
     {
         IUnknown_Release(surface->physical_surface);
-        IDCompositionSurfaceFactory_Release(surface->factory);
+        if (surface->factory)
+            IDCompositionSurfaceFactory_Release(surface->factory);
         if (surface->draw_surface)
             ID3D11Texture2D_Release(surface->draw_surface);
         free(surface);
@@ -76,8 +77,8 @@ static HRESULT STDMETHODCALLTYPE surface_BeginDraw(IDCompositionSurfaceUnknown *
         const RECT *rect, REFIID iid, void **object, POINT *offset)
 {
     struct composition_surface *surface = impl_from_IDCompositionSurfaceUnknown(iface);
-    struct composition_surface_factory *factory = impl_from_IDCompositionSurfaceFactory(surface->factory);
-    struct composition_device *device = impl_from_IDCompositionDevice(factory->device);
+    struct composition_surface_factory *factory;
+    struct composition_device *device;
     D3D11_TEXTURE2D_DESC texture_desc;
     ID3D11Texture2D *draw_surface;
     ID3D11Device *d3d11_device;
@@ -86,6 +87,16 @@ static HRESULT STDMETHODCALLTYPE surface_BeginDraw(IDCompositionSurfaceUnknown *
 
     TRACE("iface %p, rect %s, iid %s, object %p, offset %p.\n", iface, wine_dbgstr_rect(rect),
             debugstr_guid(iid), object, offset);
+
+    /* A surface created from a window shows what the window shows; there is nothing to draw to. */
+    if (!surface->factory)
+    {
+        FIXME("iface %p, cannot draw to a window surface.\n", iface);
+        return DCOMPOSITION_ERROR_SURFACE_NOT_BEING_RENDERED;
+    }
+
+    factory = impl_from_IDCompositionSurfaceFactory(surface->factory);
+    device = impl_from_IDCompositionDevice(factory->device);
 
     if (IsEqualGUID(iid, &IID_ID2D1DeviceContext))
     {
@@ -1101,6 +1112,38 @@ HRESULT create_surface(struct composition_surface_factory *factory, UINT width, 
     surface->height = height;
     surface->pixel_format = pixel_format;
     surface->alpha_mode = alpha_mode;
+    surface->ref = 1;
+
+    *dcomp_surface = (IDCompositionSurface *)&surface->IDCompositionSurfaceUnknown_iface;
+    return S_OK;
+}
+
+/* A surface that shows the content of a window. It owns no drawing resources: the compositor
+ * captures the window when it paints the visual. */
+HRESULT create_surface_from_hwnd(HWND hwnd, IDCompositionSurface **dcomp_surface)
+{
+    struct composition_surface *surface;
+    RECT rect;
+    UINT width, height;
+
+    if (!hwnd || !IsWindow(hwnd))
+        return E_INVALIDARG;
+
+    if (!GetClientRect(hwnd, &rect))
+        return E_INVALIDARG;
+    width = rect.right - rect.left;
+    height = rect.bottom - rect.top;
+
+    surface = calloc(1, sizeof(*surface));
+    if (!surface)
+        return E_OUTOFMEMORY;
+
+    surface->IDCompositionSurfaceUnknown_iface.lpVtbl = &surface_vtbl;
+    surface->hwnd = hwnd;
+    surface->width = width;
+    surface->height = height;
+    surface->pixel_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    surface->alpha_mode = DXGI_ALPHA_MODE_IGNORE;
     surface->ref = 1;
 
     *dcomp_surface = (IDCompositionSurface *)&surface->IDCompositionSurfaceUnknown_iface;

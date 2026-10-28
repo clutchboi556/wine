@@ -87,8 +87,11 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisualUnknown *iface)
             ID2D1DeviceContext_Release(visual->device_context);
         if (visual->content)
             IUnknown_Release(visual->content);
+        if (visual->transform_object)
+            composition_transform_release(visual->transform_object);
         if (visual->shared_visual_handle)
             CloseHandle(visual->shared_visual_handle);
+        shared_visual_cache_free(visual);
         dcomp_lock();
         if (visual->is_child)
             list_remove(&visual->entry);
@@ -149,9 +152,9 @@ static HRESULT STDMETHODCALLTYPE visual_SetTransformObject(IDCompositionVisualUn
 
     TRACE("iface %p, transform %p.\n", iface, transform);
 
-    /* A NULL transform object removes the transform. */
-    if (transform)
-        FIXME("Transform objects are not supported, ignoring %p.\n", transform);
+    if (visual->transform_object)
+        composition_transform_release(visual->transform_object);
+    visual->transform_object = transform ? composition_transform_from_object(transform) : NULL;
     visual->transform = identity_matrix;
     return S_OK;
 }
@@ -166,6 +169,9 @@ static HRESULT STDMETHODCALLTYPE visual_SetTransform(IDCompositionVisualUnknown 
 
     if (matrix->_11 != 1.0f || matrix->_12 != 0.0f || matrix->_21 != 0.0f || matrix->_22 != 1.0f)
         FIXME("Only translations are supported, the rest of the transform is ignored.\n");
+    if (visual->transform_object)
+        composition_transform_release(visual->transform_object);
+    visual->transform_object = NULL;
     visual->transform = *matrix;
     return S_OK;
 }
@@ -245,13 +251,14 @@ static HRESULT STDMETHODCALLTYPE visual_SetClip(IDCompositionVisualUnknown *ifac
 static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *iface, IUnknown *content)
 {
     struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
-    ID2D1GdiInteropRenderTarget *interop;
-    ID2D1DeviceContext *device_context;
+    ID2D1GdiInteropRenderTarget *interop = NULL;
+    ID2D1DeviceContext *device_context = NULL;
     IDXGISwapChain1 *dxgi_swapchain;
     IDCompositionSurface *suface;
     IDXGIDevice *dxgi_device;
     ID2D1Device *d2d_device;
     const GUID *iid = NULL;
+    BOOL window_surface = FALSE;
     HRESULT hr;
 
     FIXME("iface %p, content %p semi-stub!\n", iface, content);
@@ -278,7 +285,15 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         {
             struct composition_surface *dcomp_surface = unsafe_impl_from_IDCompositionSurface(suface);
 
-            if (IsEqualGUID(&dcomp_surface->physical_surface_iid, &IID_IDXGISurface))
+            if (dcomp_surface->hwnd)
+            {
+                /* A surface created from a window is captured when compositing, it has no rendering
+                 * device of its own. */
+                IDCompositionSurface_Release(suface);
+                iid = &IID_IDCompositionSurface;
+                window_surface = TRUE;
+            }
+            else if (IsEqualGUID(&dcomp_surface->physical_surface_iid, &IID_IDXGISurface))
             {
                 iid = &IID_IDCompositionSurface;
 
@@ -306,6 +321,9 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
             dcomp_unlock();
             return E_INVALIDARG;
         }
+
+        if (window_surface)
+            goto content_set;
 
         hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
         IDXGIDevice_Release(dxgi_device);
@@ -336,6 +354,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
         }
     }
 
+content_set:
     if (visual->interop)
     {
         ID2D1GdiInteropRenderTarget_Release(visual->interop);

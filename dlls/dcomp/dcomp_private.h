@@ -54,6 +54,7 @@ struct composition_surface
     RECT draw_rect;
     IUnknown *physical_surface;
     GUID physical_surface_iid;
+    HWND hwnd; /* surface created from a window, captured instead of read back */
     UINT width;
     UINT height;
     DXGI_FORMAT pixel_format;
@@ -70,8 +71,25 @@ struct composition_target
     BOOL topmost;
     HWND hwnd;
     HANDLE shared_visual_handle;
+    /* Where the tree of a target created from a shared visual handle is rendered, so that
+     * visuals created from the same handle in other processes can composite it. */
+    HANDLE shared_mapping;
+    void *shared_view;
+    HDC shared_dc;
+    HBITMAP shared_bitmap;
+    void *shared_bits;
+    HGDIOBJ shared_old_bitmap;
     struct list entry;
     LONG ref;
+};
+
+/* Header of the mapping a shared visual target renders into; the pixels follow it as
+ * 32-bit BGRA rows, top down. */
+struct shared_visual_header
+{
+    unsigned int seq;    /* bumped after a whole frame was written */
+    unsigned int width;
+    unsigned int height;
 };
 
 struct composition_visual
@@ -87,6 +105,7 @@ struct composition_visual
     float offset_x;
     float offset_y;
     D2D_MATRIX_3X2_F transform;
+    struct composition_transform *transform_object;
     BOOL has_clip;
     D2D_RECT_F clip;
     enum DCOMPOSITION_COMPOSITE_MODE composite_mode;
@@ -97,6 +116,15 @@ struct composition_visual
     BOOL is_root;
     BOOL is_child;
     HANDLE shared_visual_handle;
+    /* The rendered target of a shared visual that belongs to another process. */
+    HANDLE shared_mapping;
+    void *shared_view;
+    HDC shared_dc;
+    HBITMAP shared_bitmap;
+    void *shared_bits;
+    HGDIOBJ shared_old_bitmap;
+    UINT shared_width;
+    UINT shared_height;
     int version;
     /* The last composited content, so it is read back from the GPU only when it changes */
     struct
@@ -160,10 +188,26 @@ void dcomp_unlock(void);
 HRESULT create_surface(struct composition_surface_factory *factory, UINT width, UINT height,
         DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **dcomp_surface);
 HRESULT create_surface_factory(struct composition_device *device, IUnknown *rendering_device, IDCompositionSurfaceFactory **factory);
+void composite_thread_start(struct composition_device *device);
 HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
 HRESULT create_target_from_shared_visual_handle(struct composition_device *device, HANDLE shared_visual_handle, void **new_target);
+HRESULT create_surface_from_hwnd(HWND hwnd, IDCompositionSurface **surface);
 HRESULT create_visual(int version, REFIID iid, void **visual);
 HRESULT create_visual_from_shared_visual_handle(HANDLE shared_visual_handle, void **new_visual);
+HRESULT WINAPI DCompositionCreateSharedVisualHandle(HANDLE *handle);
+struct composition_transform;
+struct composition_transform *composition_transform_from_object(IDCompositionTransform *transform);
+void composition_transform_release(struct composition_transform *transform);
+HRESULT composition_transform_get_matrix(struct composition_transform *transform, D2D_MATRIX_3X2_F *matrix);
+HRESULT composition_transform_create_translate(IDCompositionTranslateTransform **transform);
+HRESULT composition_transform_create_scale(IDCompositionScaleTransform **transform);
+HRESULT composition_transform_create_rotate(IDCompositionRotateTransform **transform);
+HRESULT composition_transform_create_skew(IDCompositionSkewTransform **transform);
+HRESULT composition_transform_create_matrix(IDCompositionMatrixTransform **transform);
+HRESULT composition_transform_create_group(IDCompositionTransform **transforms, UINT elements,
+        IDCompositionTransform **group);
+void shared_visual_target_free(struct composition_target *target);
+void shared_visual_cache_free(struct composition_visual *visual);
 
 
 #endif /* __WINE_DCOMP_PRIVATE_H */

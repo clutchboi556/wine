@@ -8,4 +8,5 @@ SOURCES = \
 	device.c \
 	surface.c \
 	target.c \
+	transform.c \
 	visual.c

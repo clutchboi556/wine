@@ -436,8 +436,7 @@ static BOOL visual_resize_cache(struct composition_visual *visual, UINT width, U
 }
 
 /* Read the surface back from the GPU into the visual's cache. */
-static HRESULT update_visual_cache(const struct composition_target *target,
-                                   struct composition_visual *visual,
+static HRESULT update_visual_cache(struct composition_visual *visual,
                                    IDXGISurface *dxgi_surface)
 {
     ID3DDeviceContextState *state = NULL, *old_state = NULL;
@@ -462,12 +461,6 @@ static HRESULT update_visual_cache(const struct composition_target *target,
         D3D_FEATURE_LEVEL_10_1,
         D3D_FEATURE_LEVEL_10_0,
     };
-
-    if (!target->root)
-    {
-        ERR("Target has no root.\n");
-        goto done;
-    }
 
     hr = IDXGISurface_GetDevice(dxgi_surface, &IID_ID3D11Device1, (void **)&d3d11_device);
     if (FAILED(hr))
@@ -625,13 +618,11 @@ static LONG clamp_coord(float value)
     return (LONG)floorf(value + 0.5f);
 }
 
-static void blit_visual_cache(const struct composition_target *target, const struct composition_visual *visual,
+static void blit_visual_cache(HDC dst_dc, const struct composition_visual *visual,
                               const struct composite_state *state)
 {
     LONG x = clamp_coord(state->x), y = clamp_coord(state->y);
     RECT rect;
-    HDC dst_dc;
-    DWORD style;
 
     static const BLENDFUNCTION blend_func =
     {
@@ -641,51 +632,192 @@ static void blit_visual_cache(const struct composition_target *target, const str
       AC_SRC_ALPHA /* AlphaFormat */
     };
 
-    style = DCX_USESTYLE | DCX_CACHE;
-    if (!target->topmost)
-        style |= DCX_CLIPCHILDREN;
     SetRect(&rect, x, y, x + visual->cache.width, y + visual->cache.height);
     if (!IntersectRect(&rect, &rect, &state->clip))
         return;
 
-    dst_dc = GetDCEx(target->hwnd, 0, style);
     GdiAlphaBlend(dst_dc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                   visual->cache.dc, rect.left - x, rect.top - y, rect.right - rect.left,
                   rect.bottom - rect.top, blend_func);
-    ReleaseDC(target->hwnd, dst_dc);
 }
 
-static struct composition_visual * shared_visual_target_get_root(HANDLE shared_visual_handle)
+struct shared_visual_info
 {
-    struct composition_visual *visual = NULL;
+    HANDLE mapping;                  /* the target rendered by the owning process */
+    UINT width;
+    UINT height;
+};
+
+static HRESULT shared_visual_get_info(HANDLE shared_visual_handle, struct shared_visual_info *info)
+{
     NTSTATUS status;
+
+    memset(info, 0, sizeof(*info));
 
     SERVER_START_REQ(dcomp_get_shared_visual_info)
     {
         req->handle = wine_server_obj_handle(shared_visual_handle);
         if (!(status = wine_server_call(req)))
-            visual = impl_from_IDCompositionVisual(wine_server_get_ptr(reply->target_root));
+        {
+            info->mapping = wine_server_ptr_handle(reply->section);
+            info->width = reply->width;
+            info->height = reply->height;
+        }
     }
     SERVER_END_REQ;
 
-    if (status)
-        ERR("dcomp_get_shared_visual_info failed, not in the same process? status %#lx.\n", status);
-
-    return visual;
+    return status ? E_FAIL : S_OK;
 }
 
-static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual,
+/* Composite the target that another process rendered for this shared visual. */
+static void blit_shared_visual(HDC dst_dc, struct composition_visual *visual,
+                               const struct composite_state *state, const struct shared_visual_info *info)
+{
+    static const BLENDFUNCTION blend_func = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    const struct shared_visual_header *header;
+    BITMAPINFO bitmap_info;
+    SIZE_T size, row;
+    LONG x, y, i;
+    RECT rect;
+    UINT src_x, src_y;
+
+    if (!info->mapping || !info->width || !info->height)
+        return;
+
+    if (!visual->shared_view)
+    {
+        size = sizeof(*header) + (SIZE_T)info->width * info->height * 4;
+        if (!(visual->shared_view = MapViewOfFile(info->mapping, FILE_MAP_READ, 0, 0, size)))
+        {
+            ERR("Failed to map the shared visual target, error %lu.\n", GetLastError());
+            return;
+        }
+        visual->shared_mapping = info->mapping;
+        visual->shared_width = info->width;
+        visual->shared_height = info->height;
+
+        memset(&bitmap_info, 0, sizeof(bitmap_info));
+        bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmap_info.bmiHeader.biWidth = info->width;
+        bitmap_info.bmiHeader.biHeight = -((LONG)info->height);
+        bitmap_info.bmiHeader.biPlanes = 1;
+        bitmap_info.bmiHeader.biBitCount = 32;
+        bitmap_info.bmiHeader.biCompression = BI_RGB;
+        visual->shared_dc = CreateCompatibleDC(NULL);
+        visual->shared_bitmap = CreateDIBSection(visual->shared_dc, &bitmap_info, DIB_RGB_COLORS,
+                                                &visual->shared_bits, NULL, 0);
+        visual->shared_old_bitmap = SelectObject(visual->shared_dc, visual->shared_bitmap);
+    }
+    else
+    {
+        /* The handle was allocated for this call only; the mapping is already mapped. */
+        CloseHandle(info->mapping);
+    }
+
+    if (!visual->shared_view || visual->shared_width != info->width || visual->shared_height != info->height)
+        return;
+
+    header = visual->shared_view;
+
+    x = clamp_coord(state->x);
+    y = clamp_coord(state->y);
+    SetRect(&rect, x, y, x + (LONG)visual->shared_width, y + (LONG)visual->shared_height);
+    if (!IntersectRect(&rect, &rect, &state->clip))
+        return;
+
+    src_x = rect.left - x;
+    src_y = rect.top - y;
+    row = (SIZE_T)(rect.right - rect.left) * 4;
+    for (i = rect.top; i < rect.bottom; i++)
+        memcpy((BYTE *)visual->shared_bits + (i - rect.top) * row,
+               (const BYTE *)visual->shared_view + sizeof(*header)
+                       + ((SIZE_T)(src_y + i - rect.top) * visual->shared_width + src_x) * 4, row);
+
+    TRACE("Blitting shared visual %p, %ldx%ld at %ld,%ld.\n", visual, rect.right - rect.left,
+          rect.bottom - rect.top, rect.left, rect.top);
+
+    /* A frame rendered while the copy above was in flight is not retried: the next refresh
+     * composites the whole target again. */
+    GdiAlphaBlend(dst_dc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                  visual->shared_dc, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                  blend_func);
+}
+
+/* Copy a window and its visible children into a DC at the given origin. A window DC leaves out
+ * child windows, so the content of a composited window only shows up when they are drawn too. */
+static void capture_window(HDC dst_dc, HWND hwnd, LONG x, LONG y)
+{
+    RECT rect, child_rect;
+    HDC hdc;
+    HWND child;
+
+    if (!GetClientRect(hwnd, &rect) || rect.right <= 0 || rect.bottom <= 0)
+        return;
+
+    if ((hdc = GetDCEx(hwnd, 0, DCX_CACHE | DCX_USESTYLE | DCX_CLIPCHILDREN)))
+    {
+        BitBlt(dst_dc, x, y, rect.right, rect.bottom, hdc, 0, 0, SRCCOPY);
+        ReleaseDC(hwnd, hdc);
+    }
+
+    for (child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+    {
+        if (!IsWindowVisible(child))
+            continue;
+        if (!GetWindowRect(child, &child_rect))
+            continue;
+        MapWindowPoints(NULL, hwnd, (POINT *)&child_rect, 2);
+        capture_window(dst_dc, child, x + child_rect.left, y + child_rect.top);
+    }
+}
+
+/* Read back the window that a surface created from an HWND shows. */
+static HRESULT update_visual_cache_from_window(struct composition_visual *visual, HWND hwnd)
+{
+    RECT rect;
+
+    if (!GetClientRect(hwnd, &rect))
+        return E_FAIL;
+    if (rect.right <= 0 || rect.bottom <= 0)
+        return E_FAIL;
+    if (!visual_resize_cache(visual, rect.right, rect.bottom))
+        return E_OUTOFMEMORY;
+
+    capture_window(visual->cache.dc, hwnd, 0, 0);
+    return S_OK;
+}
+
+/* Window content is opaque: the captured DIB has no alpha channel, so blend it in with SRCCOPY. */
+static void blit_visual_window(HDC dst_dc, const struct composition_visual *visual,
+                               const struct composite_state *state)
+{
+    LONG x = clamp_coord(state->x), y = clamp_coord(state->y);
+    RECT rect;
+
+    SetRect(&rect, x, y, x + visual->cache.width, y + visual->cache.height);
+    if (!IntersectRect(&rect, &rect, &state->clip))
+        return;
+
+    BitBlt(dst_dc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+           visual->cache.dc, rect.left - x, rect.top - y, SRCCOPY);
+}
+
+static HRESULT do_composite(HDC dst_dc, struct composition_visual *visual,
                             const struct composite_state *parent_state)
 {
     struct composition_visual *child_visual;
     struct composite_state state = *parent_state;
+    D2D_MATRIX_3X2_F transform;
     IDXGISurface *dxgi_surface = NULL;
     UINT content_version = 0;
     HRESULT hr;
 
     /* The visual's transform is applied before its offset; only translations are supported. */
-    state.x += visual->offset_x + visual->transform._31;
-    state.y += visual->offset_y + visual->transform._32;
+    transform = visual->transform;
+    if (visual->transform_object)
+        composition_transform_get_matrix(visual->transform_object, &transform);
+    state.x += visual->offset_x + transform._31;
+    state.y += visual->offset_y + transform._32;
     if (visual->has_clip)
     {
         RECT clip;
@@ -698,9 +830,12 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
 
     if (visual->shared_visual_handle)
     {
-        struct composition_visual *root = shared_visual_target_get_root(visual->shared_visual_handle);
-        if (root)
-            do_composite(target, root, &state);
+        struct shared_visual_info info;
+
+        /* The target that renders into the shared visual belongs to the process that created
+         * it; only the rendered mapping is valid across processes. */
+        if (SUCCEEDED(shared_visual_get_info(visual->shared_visual_handle, &info)))
+            blit_shared_visual(dst_dc, visual, &state, &info);
     }
 
     /* Render content */
@@ -759,6 +894,16 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
             }
 
             surface_impl = impl_from_IDCompositionSurface(surface);
+            if (surface_impl->hwnd)
+            {
+                HWND hwnd = surface_impl->hwnd;
+
+                IDCompositionSurface_Release(surface);
+                if (FAILED(hr = update_visual_cache_from_window(visual, hwnd)))
+                    return hr;
+                blit_visual_window(dst_dc, visual, &state);
+                goto composite_children;
+            }
             if (IsEqualGUID(&surface_impl->physical_surface_iid, &IID_IDXGISurface))
             {
                 /* Only EndDraw() changes what the surface shows. */
@@ -789,7 +934,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
         {
             /* Reading the surface back holds the rendering device's lock; skip it when
              * the content did not change and repaint the window from the cache. */
-            if (SUCCEEDED(update_visual_cache(target, visual, dxgi_surface)))
+            if (SUCCEEDED(update_visual_cache(visual, dxgi_surface)))
             {
                 visual->cache.content = visual->content;
                 visual->cache.content_version = content_version;
@@ -801,17 +946,162 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
             IDXGISurface_Release(dxgi_surface);
         }
         if (visual->cache.content)
-            blit_visual_cache(target, visual, &state);
+            blit_visual_cache(dst_dc, visual, &state);
     }
 
+composite_children:
     LIST_FOR_EACH_ENTRY(child_visual, &visual->child_visuals, struct composition_visual, entry)
     {
-        do_composite(target, child_visual, &state);
+        do_composite(dst_dc, child_visual, &state);
     }
 
     return S_OK;
 }
 
+
+/* The rendered target of a shared visual is published to the other processes through the
+ * server, so that a visual created from the same handle can composite it there. */
+#define SHARED_VISUAL_WIDTH  1280
+#define SHARED_VISUAL_HEIGHT 1024
+
+static void shared_visual_target_set_info(struct composition_target *target, UINT width, UINT height)
+{
+    NTSTATUS status;
+
+    SERVER_START_REQ(dcomp_set_shared_visual_info)
+    {
+        req->handle = wine_server_obj_handle(target->shared_visual_handle);
+        req->section = wine_server_obj_handle(target->shared_mapping);
+        req->width = width;
+        req->height = height;
+        status = wine_server_call(req);
+    }
+    SERVER_END_REQ;
+
+    if (status)
+        ERR("dcomp_set_shared_visual_info failed, status %#lx.\n", status);
+}
+
+static BOOL shared_target_create_surface(struct composition_target *target)
+{
+    struct shared_visual_header *header;
+    BITMAPINFO bitmap_info;
+    SIZE_T size;
+
+    size = sizeof(*header) + (SIZE_T)SHARED_VISUAL_WIDTH * SHARED_VISUAL_HEIGHT * 4;
+
+    if (!(target->shared_mapping = CreateFileMappingW(NULL, NULL, PAGE_READWRITE, 0, size, NULL)))
+    {
+        ERR("Failed to create the shared visual mapping, error %lu.\n", GetLastError());
+        return FALSE;
+    }
+    if (!(target->shared_view = MapViewOfFile(target->shared_mapping, FILE_MAP_ALL_ACCESS, 0, 0, size)))
+    {
+        ERR("Failed to map the shared visual mapping, error %lu.\n", GetLastError());
+        CloseHandle(target->shared_mapping);
+        target->shared_mapping = NULL;
+        return FALSE;
+    }
+    if (!(target->shared_dc = CreateCompatibleDC(NULL)))
+        goto failed;
+
+    memset(&bitmap_info, 0, sizeof(bitmap_info));
+    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap_info.bmiHeader.biWidth = SHARED_VISUAL_WIDTH;
+    bitmap_info.bmiHeader.biHeight = -SHARED_VISUAL_HEIGHT;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    if (!(target->shared_bitmap = CreateDIBSection(target->shared_dc, &bitmap_info, DIB_RGB_COLORS,
+                                                  &target->shared_bits, NULL, 0)))
+        goto failed;
+    target->shared_old_bitmap = SelectObject(target->shared_dc, target->shared_bitmap);
+
+    header = target->shared_view;
+    header->seq = 0;
+    header->width = SHARED_VISUAL_WIDTH;
+    header->height = SHARED_VISUAL_HEIGHT;
+
+    shared_visual_target_set_info(target, SHARED_VISUAL_WIDTH, SHARED_VISUAL_HEIGHT);
+    return TRUE;
+
+failed:
+    ERR("Failed to create the shared visual surface, error %lu.\n", GetLastError());
+    shared_visual_target_free(target);
+    return FALSE;
+}
+
+static BOOL present_shared_target(struct composition_target *target)
+{
+    const struct shared_visual_header *header;
+    struct composite_state state;
+    SIZE_T pixels;
+
+    TRACE("Rendering shared target %p, root %p.\n", target, target->root);
+    if (!target->root)
+        return FALSE;
+    if (!target->shared_view && !shared_target_create_surface(target))
+        return FALSE;
+
+    pixels = (SIZE_T)SHARED_VISUAL_WIDTH * SHARED_VISUAL_HEIGHT * 4;
+    memset(target->shared_bits, 0, pixels);
+    state.x = state.y = 0.0f;
+    SetRect(&state.clip, 0, 0, SHARED_VISUAL_WIDTH, SHARED_VISUAL_HEIGHT);
+    if (FAILED(do_composite(target->shared_dc, impl_from_IDCompositionVisual(target->root), &state)))
+        return FALSE;
+
+    header = target->shared_view;
+    memcpy((BYTE *)target->shared_view + sizeof(*header), target->shared_bits, pixels);
+    TRACE("Presented shared target %p, frame %u.\n", target, header->seq + 1);
+    ((struct shared_visual_header *)header)->seq++;
+    return TRUE;
+}
+
+void shared_visual_target_free(struct composition_target *target)
+{
+    if (target->shared_dc)
+    {
+        if (target->shared_old_bitmap)
+            SelectObject(target->shared_dc, target->shared_old_bitmap);
+        if (target->shared_bitmap)
+            DeleteObject(target->shared_bitmap);
+        DeleteDC(target->shared_dc);
+        target->shared_dc = NULL;
+    }
+    if (target->shared_view)
+    {
+        UnmapViewOfFile(target->shared_view);
+        target->shared_view = NULL;
+    }
+    if (target->shared_mapping)
+    {
+        CloseHandle(target->shared_mapping);
+        target->shared_mapping = NULL;
+    }
+}
+
+void shared_visual_cache_free(struct composition_visual *visual)
+{
+    if (visual->shared_dc)
+    {
+        if (visual->shared_old_bitmap)
+            SelectObject(visual->shared_dc, visual->shared_old_bitmap);
+        if (visual->shared_bitmap)
+            DeleteObject(visual->shared_bitmap);
+        DeleteDC(visual->shared_dc);
+        visual->shared_dc = NULL;
+    }
+    if (visual->shared_view)
+    {
+        UnmapViewOfFile(visual->shared_view);
+        visual->shared_view = NULL;
+    }
+    if (visual->shared_mapping)
+    {
+        CloseHandle(visual->shared_mapping);
+        visual->shared_mapping = NULL;
+    }
+}
 
 static DWORD WINAPI composite_thread_proc(void *iface)
 {
@@ -820,6 +1110,8 @@ static DWORD WINAPI composite_thread_proc(void *iface)
     struct composition_target *target;
     struct composition_visual *visual;
     struct composite_state state;
+    HRESULT hr;
+    DWORD style;
     HDC hdc;
 
     /* TODO: Implement and use D3DKMTWaitForVerticalBlankEvent() */
@@ -835,22 +1127,43 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         count = 0;
         LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
         {
+            /* Targets created from a shared visual handle have no window; they are rendered into
+             * the mapping from which the matching visual composites them in the other process. */
+            /* A shared target is driven by the compositor of its own process, which does not
+             * necessarily commit: it must keep its producer thread alive on its own. */
+            if (target->shared_visual_handle)
+            {
+                TRACE("Shared target %p, root %p.\n", target, target->root);
+                present_shared_target(target);
+                count++;
+                continue;
+            }
+
             if (!target->root)
             {
                 FIXME("Target %p has no root.\n", &target->IDCompositionTarget_iface);
                 continue;
             }
 
-            /* Skip targets created from a shared visual handle. Composition for such targets will
-             * be done for the visual tree where the visual created from the shared visual handle is at */
-            if (target->shared_visual_handle)
-                continue;
-
             visual = impl_from_IDCompositionVisual(target->root);
             state.x = state.y = 0.0f;
             GetClientRect(target->hwnd, &state.clip);
-            if (SUCCEEDED(do_composite(target, visual, &state)))
+
+            style = DCX_USESTYLE | DCX_CACHE;
+            if (!target->topmost)
+                style |= DCX_CLIPCHILDREN;
+            if (!(hdc = GetDCEx(target->hwnd, 0, style)))
+            {
+                WARN("GetDCEx(%p, %#lx) failed, error %lu.\n", target->hwnd, style, GetLastError());
+                continue;
+            }
+
+            hr = do_composite(hdc, visual, &state);
+            if (SUCCEEDED(hr))
                 count++;
+            else
+                WARN("do_composite(%p) failed, hr %#lx.\n", target->hwnd, hr);
+            ReleaseDC(target->hwnd, hdc);
         }
 
         if (!count)
@@ -872,14 +1185,13 @@ static DWORD WINAPI composite_thread_proc(void *iface)
     return 0;
 }
 
-static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
+/* Start the composite thread of a device unless it is already running. Called from Commit() and
+ * from the shared visual paths, whose producer never commits its device. */
+void composite_thread_start(struct composition_device *device)
 {
-    struct composition_device *device = impl_from_IDCompositionDevice(iface);
-    HRESULT hr = S_OK;
-
-    FIXME("iface %p semi-stub!\n", iface);
-
     dcomp_lock();
+    TRACE("Starting composition thread for device %p, thread %p, exited %u.\n", device,
+          device->thread, device->thread_exited);
 
     if (!device->thread || device->thread_exited)
     {
@@ -891,12 +1203,21 @@ static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
         }
         device->thread_exited = FALSE;
         device->exit_thread = FALSE;
-        device->thread = CreateThread(NULL, 0, composite_thread_proc, iface, 0, NULL);
+        device->thread = CreateThread(NULL, 0, composite_thread_proc, device, 0, NULL);
     }
 
     dcomp_unlock();
+}
 
-    return hr;
+static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
+{
+    struct composition_device *device = impl_from_IDCompositionDevice(iface);
+
+    FIXME("iface %p semi-stub!\n", iface);
+
+    composite_thread_start(device);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE device_WaitForCommitCompletion(IDCompositionDevice *iface)
@@ -958,52 +1279,88 @@ static HRESULT STDMETHODCALLTYPE device_CreateSurfaceFromHandle(IDCompositionDev
 static HRESULT STDMETHODCALLTYPE device_CreateSurfaceFromHwnd(IDCompositionDevice *iface,
         HWND hwnd, IUnknown **surface)
 {
-    FIXME("iface %p, hwnd %p, surface %p stub!\n", iface, hwnd, surface);
-    return E_NOTIMPL;
+    IDCompositionSurface *dcomp_surface;
+    HRESULT hr;
+
+    TRACE("iface %p, hwnd %p, surface %p.\n", iface, hwnd, surface);
+
+    if (!surface)
+        return E_INVALIDARG;
+    *surface = NULL;
+
+    if (FAILED(hr = create_surface_from_hwnd(hwnd, &dcomp_surface)))
+        return hr;
+
+    *surface = (IUnknown *)dcomp_surface;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateTranslateTransform(IDCompositionDevice *iface,
         IDCompositionTranslateTransform **transform)
 {
-    FIXME("iface %p, transform %p stub!\n", iface, transform);
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p.\n", iface, transform);
+
+    if (!transform)
+        return E_INVALIDARG;
+
+    return composition_transform_create_translate(transform);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateScaleTransform(IDCompositionDevice *iface,
         IDCompositionScaleTransform **transform)
 {
-    FIXME("iface %p, transform %p stub!\n", iface, transform);
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p.\n", iface, transform);
+
+    if (!transform)
+        return E_INVALIDARG;
+
+    return composition_transform_create_scale(transform);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateRotateTransform(IDCompositionDevice *iface,
         IDCompositionRotateTransform **transform)
 {
-    FIXME("iface %p, transform %p stub!\n", iface, transform);
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p.\n", iface, transform);
+
+    if (!transform)
+        return E_INVALIDARG;
+
+    return composition_transform_create_rotate(transform);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateSkewTransform(IDCompositionDevice *iface,
         IDCompositionSkewTransform **transform)
 {
-    FIXME("iface %p, transform %p stub!\n", iface, transform);
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p.\n", iface, transform);
+
+    if (!transform)
+        return E_INVALIDARG;
+
+    return composition_transform_create_skew(transform);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateMatrixTransform(IDCompositionDevice *iface,
         IDCompositionMatrixTransform **transform)
 {
-    FIXME("iface %p, transform %p stub!\n", iface, transform);
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p.\n", iface, transform);
+
+    if (!transform)
+        return E_INVALIDARG;
+
+    return composition_transform_create_matrix(transform);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateTransformGroup(IDCompositionDevice *iface,
         IDCompositionTransform **transforms, UINT elements,
         IDCompositionTransform **transform_group)
 {
-    FIXME("iface %p, transforms %p, elements %u, transform_group %p stub!\n", iface, transforms,
+    TRACE("iface %p, transforms %p, elements %u, transform_group %p.\n", iface, transforms,
             elements, transform_group);
-    return E_NOTIMPL;
+
+    if (!transform_group)
+        return E_INVALIDARG;
+
+    return composition_transform_create_group(transforms, elements, transform_group);
 }
 
 static HRESULT STDMETHODCALLTYPE device_CreateTranslateTransform3D(IDCompositionDevice *iface,
@@ -1312,56 +1669,94 @@ static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurfaceFromHandle(IDCompos
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateSurfaceFromHwnd(IDCompositionDeviceUnknown *iface,
         HWND hwnd, IUnknown **surface)
 {
-    FIXME("iface %p, hwnd %p, surface %p stub!\n", iface, hwnd, surface);
-    return E_NOTIMPL;
+    struct composition_device *device = impl_from_IDCompositionDeviceUnknown(iface);
+
+    TRACE("iface %p, hwnd %p, surface %p.\n", iface, hwnd, surface);
+
+    return IDCompositionDevice_CreateSurfaceFromHwnd(&device->IDCompositionDevice_iface, hwnd,
+            surface);
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateSharedResource(IDCompositionDeviceUnknown *iface,
         REFIID riid, void **obj)
 {
-    FIXME("iface %p, riid %s, obj %p stub!\n", iface, debugstr_guid(riid), obj);
-    return E_NOTIMPL;
+    HANDLE handle;
+    HRESULT hr;
+
+    TRACE("iface %p, riid %s, obj %p\n", iface, debugstr_guid(riid), obj);
+
+    if (!obj)
+        return E_POINTER;
+    *obj = NULL;
+
+    if (!IsEqualGUID(riid, &IID_IDCompositionVisual))
+    {
+        FIXME("Unsupported resource iid %s.\n", debugstr_guid(riid));
+        return E_NOINTERFACE;
+    }
+
+    if (FAILED(hr = DCompositionCreateSharedVisualHandle(&handle)))
+        return hr;
+
+    hr = create_visual_from_shared_visual_handle(handle, obj);
+    CloseHandle(handle);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_OpenSharedResourceHandle(IDCompositionDeviceUnknown *iface,
         IUnknown *unknown, HANDLE *handle)
 {
-    FIXME("iface %p, unknown %p, handle %p stub!\n", iface, unknown, handle);
-    return E_NOTIMPL;
+    IDCompositionVisual *visual_iface;
+    struct composition_visual *visual;
+    HANDLE duplicated;
+
+    TRACE("iface %p, unknown %p, handle %p\n", iface, unknown, handle);
+
+    if (!unknown || !handle)
+        return E_POINTER;
+
+    if (FAILED(IUnknown_QueryInterface(unknown, &IID_IDCompositionVisual, (void **)&visual_iface)))
+        return E_NOINTERFACE;
+    visual = impl_from_IDCompositionVisual(visual_iface);
+
+    if (!visual->shared_visual_handle)
+    {
+        IDCompositionVisual_Release(visual_iface);
+        WARN("Visual %p was not created from a shared resource.\n", unknown);
+        return E_INVALIDARG;
+    }
+
+    if (!DuplicateHandle(GetCurrentProcess(), visual->shared_visual_handle, GetCurrentProcess(),
+                         &duplicated, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        ERR("Cannot duplicate handle, last error %lu.\n", GetLastError());
+        IDCompositionVisual_Release(visual_iface);
+        return E_FAIL;
+    }
+
+    *handle = duplicated;
+    IDCompositionVisual_Release(visual_iface);
+    return S_OK;
 }
+
 
 static HRESULT STDMETHODCALLTYPE desktop_device_CreateFromSharedVisualHandle(IDCompositionDeviceUnknown *iface,
      HANDLE visual_handle, REFIID iid, void **out)
 {
-    HRESULT hr;
+    TRACE("iface %p, visual_handle %p, iid %s, out %p.\n", iface, visual_handle, debugstr_guid(iid), out);
 
-    FIXME("iface %p visual_handle %p, iid %s, out %p stub!\n", iface, visual_handle, debugstr_guid(iid), out);
-
-    /* visual_handle is from DCompositionCreateSharedVisualHandle(). iid is IID_IDCompositionVisual
-    * or IDCompositionTarget */
-    assert(IsEqualGUID(iid, &IID_IDCompositionVisual) || IsEqualGUID(iid, &IID_IDCompositionTarget));
-    assert(out);
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
 
     if (IsEqualGUID(iid, &IID_IDCompositionVisual))
-    {
-        hr = create_visual_from_shared_visual_handle(visual_handle, out);
-        FIXME("Created a IDCompositionVisual %p from a shared visual handle %p, hr %#lx.\n", *out,
-              visual_handle, hr);
-        return hr;
-    }
-    else if (IsEqualGUID(iid, &IID_IDCompositionTarget))
-    {
-        hr = create_target_from_shared_visual_handle(impl_from_IDCompositionDeviceUnknown(iface),
-                                                     visual_handle, (void **)out);
-        FIXME("Created a IDCompositionTarget %p from a shared visual handle %p, hr %#lx.\n", *out,
-              visual_handle, hr);
-        return hr;
-    }
-    else
-    {
-        FIXME("Unsupported GUID %s, returning E_NOTIMPL.\n", debugstr_guid(iid));
-        return E_NOTIMPL;
-    }
+        return create_visual_from_shared_visual_handle(visual_handle, out);
+    if (IsEqualGUID(iid, &IID_IDCompositionTarget))
+        return create_target_from_shared_visual_handle(impl_from_IDCompositionDeviceUnknown(iface),
+                                                       visual_handle, out);
+
+    FIXME("Unsupported iid %s.\n", debugstr_guid(iid));
+    return E_INVALIDARG;
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_Unknown1(IDCompositionDeviceUnknown *iface)
