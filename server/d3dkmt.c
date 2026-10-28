@@ -736,7 +736,9 @@ struct composition
 {
     struct object obj;                      /* object header */
     struct process *process;                /* owner process */
-    client_ptr_t target_root;               /* root IDCompositionVisual pointer for the target created from this shared visual */
+    struct object *section;                 /* mapping with the rendered target, so other processes can composite it */
+    unsigned int width;                     /* width of the rendered target */
+    unsigned int height;                    /* height of the rendered target */
 };
 
 static void composition_dump( struct object *obj, int verbose );
@@ -760,6 +762,8 @@ static void composition_destroy( struct object *obj )
 {
     struct composition *composition = (struct composition *)obj;
 
+    if (composition->section)
+        release_object( composition->section );
     release_object( composition->process );
 }
 
@@ -774,7 +778,8 @@ static struct composition *create_composition(void)
 
     if ((composition = alloc_object( &composition_ops )))
     {
-        composition->target_root = 0;
+        composition->section = NULL;
+        composition->width = composition->height = 0;
         composition->process = (struct process *)grab_object( current->process );
     }
 
@@ -798,18 +803,27 @@ DECL_HANDLER(dcomp_create_shared_visual)
 DECL_HANDLER(dcomp_set_shared_visual_info)
 {
     struct composition *composition;
+    struct object *section = NULL;
 
     composition = get_composition_obj( current->process, req->handle, 0);
     if (!composition) return;
 
-    if (composition->process != current->process)
+    /* The target is often created in another process than the shared visual, so the state
+     * of both has to be kept here rather than in the process that created the visual. */
+    if (req->section && !(section = get_handle_obj( current->process, req->section, 0, NULL )))
     {
         release_object( composition );
-        set_error(STATUS_NOT_IMPLEMENTED);
         return;
     }
 
-    composition->target_root = req->target_root;
+    if (section)
+    {
+        if (composition->section)
+            release_object( composition->section );
+        composition->section = section;
+        composition->width = req->width;
+        composition->height = req->height;
+    }
     release_object( composition );
 }
 
@@ -822,13 +836,13 @@ DECL_HANDLER(dcomp_get_shared_visual_info)
     composition = get_composition_obj( current->process, req->handle, 0);
     if (!composition) return;
 
-    if (composition->process != current->process)
+    if (composition->section)
     {
-        release_object( composition );
-        set_error(STATUS_NOT_IMPLEMENTED);
-        return;
+        reply->section = alloc_handle_no_access_check( current->process, composition->section,
+                                                       SECTION_MAP_READ, 0 );
+        reply->width = composition->width;
+        reply->height = composition->height;
     }
 
-    reply->target_root = composition->target_root;
     release_object( composition );
 }

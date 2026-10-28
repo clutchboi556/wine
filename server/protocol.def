@@ -4362,7 +4362,9 @@ enum inproc_sync_type
 /* Set info for a DirectComposition shared visual object */
 @REQ(dcomp_set_shared_visual_info)
     obj_handle_t  handle;                    /* shared visual handle */
-    client_ptr_t  target_root;               /* root IDCompositionVisual pointer for the target created from this shared visual */
+    obj_handle_t  section;                   /* mapping with the rendered target, for consumers in other processes */
+    unsigned int  width;                     /* width of the rendered target */
+    unsigned int  height;                    /* height of the rendered target */
 @END
 
 
@@ -4370,5 +4372,7 @@ enum inproc_sync_type
 @REQ(dcomp_get_shared_visual_info)
     obj_handle_t  handle;                     /* shared visual handle */
 @REPLY
-    client_ptr_t  target_root;                /* root IDCompositionVisual pointer for the target created from this shared visual */
+    obj_handle_t  section;                    /* handle to the mapping with the rendered target */
+    unsigned int  width;                      /* width of the rendered target */
+    unsigned int  height;                     /* height of the rendered target */
 @END

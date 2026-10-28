@@ -3563,7 +3563,9 @@ static void dump_dcomp_create_shared_visual_reply( const struct dcomp_create_sha
 static void dump_dcomp_set_shared_visual_info_request( const struct dcomp_set_shared_visual_info_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
-    dump_uint64( ", target_root=", &req->target_root );
+    fprintf( stderr, ", section=%04x", req->section );
+    fprintf( stderr, ", width=%08x", req->width );
+    fprintf( stderr, ", height=%08x", req->height );
 }
 
 static void dump_dcomp_get_shared_visual_info_request( const struct dcomp_get_shared_visual_info_request *req )
@@ -3573,7 +3575,9 @@ static void dump_dcomp_get_shared_visual_info_request( const struct dcomp_get_sh
 
 static void dump_dcomp_get_shared_visual_info_reply( const struct dcomp_get_shared_visual_info_reply *req )
 {
-    dump_uint64( " target_root=", &req->target_root );
+    fprintf( stderr, " section=%04x", req->section );
+    fprintf( stderr, ", width=%08x", req->width );
+    fprintf( stderr, ", height=%08x", req->height );
 }
 
 typedef void (*dump_func)( const void *req );

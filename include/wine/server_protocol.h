@@ -6280,7 +6280,10 @@ struct dcomp_set_shared_visual_info_request
 {
     struct request_header __header;
     obj_handle_t  handle;
-    client_ptr_t  target_root;
+    obj_handle_t  section;
+    unsigned int  width;
+    unsigned int  height;
+    char __pad_28[4];
 };
 struct dcomp_set_shared_visual_info_reply
 {
@@ -6297,7 +6300,10 @@ struct dcomp_get_shared_visual_info_request
 struct dcomp_get_shared_visual_info_reply
 {
     struct reply_header __header;
-    client_ptr_t  target_root;
+    obj_handle_t  section;
+    unsigned int  width;
+    unsigned int  height;
+    char __pad_20[4];
 };
 
 
@@ -7253,6 +7259,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 965
+#define SERVER_PROTOCOL_VERSION 971
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
