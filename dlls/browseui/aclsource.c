@@ -19,6 +19,8 @@
  */
 
 #include <stdarg.h>
+#include <stdlib.h>
+#include <wchar.h>
 
 #define COBJMACROS
 
@@ -43,7 +45,43 @@ typedef struct tagACLShellSource {
     IACList2 IACList2_iface;
     LONG refCount;
     DWORD dwOptions;
+    WCHAR **items;
+    UINT count;
+    UINT pos;
 } ACLShellSource;
+
+static void clear_items(ACLShellSource *This)
+{
+    UINT i;
+
+    for (i = 0; i < This->count; i++)
+        free(This->items[i]);
+    free(This->items);
+    This->items = NULL;
+    This->count = 0;
+    This->pos = 0;
+}
+
+static BOOL append_item(ACLShellSource *This, const WCHAR *str)
+{
+    WCHAR **items;
+    WCHAR *copy;
+    SIZE_T len = wcslen(str) + 1;
+
+    if (!(copy = malloc(len * sizeof(WCHAR))))
+        return FALSE;
+    memcpy(copy, str, len * sizeof(WCHAR));
+
+    if (!(items = realloc(This->items, (This->count + 1) * sizeof(*items))))
+    {
+        free(copy);
+        return FALSE;
+    }
+
+    items[This->count++] = copy;
+    This->items = items;
+    return TRUE;
+}
 
 static inline ACLShellSource *impl_from_IACList2(IACList2 *iface)
 {
@@ -98,7 +136,10 @@ static ULONG WINAPI ACLShellSource_Release(IEnumString *iface)
     TRACE("(%p)->(%lu)\n", This, ref);
 
     if (ref == 0)
+    {
+        clear_items(This);
         free(This);
+    }
     return ref;
 }
 
@@ -106,29 +147,107 @@ static HRESULT WINAPI ACLShellSource_Next(IEnumString *iface, ULONG celt, LPOLES
     ULONG *fetched)
 {
     ACLShellSource *This = impl_from_IEnumString(iface);
-    FIXME("(%p)->(%lu %p %p): stub\n", This, celt, rgelt, fetched);
-    return E_NOTIMPL;
+    ULONG i = 0;
+
+    TRACE("(%p)->(%lu %p %p)\n", This, celt, rgelt, fetched);
+
+    if (!celt)
+    {
+        if (fetched)
+            *fetched = 0;
+        return S_OK;
+    }
+
+    if (!rgelt)
+        return E_INVALIDARG;
+
+    while (i < celt && This->pos < This->count)
+    {
+        SIZE_T len = wcslen(This->items[This->pos]) + 1;
+        LPOLESTR str;
+
+        if (!(str = CoTaskMemAlloc(len * sizeof(WCHAR))))
+        {
+            if (!i)
+                return E_OUTOFMEMORY;
+            break;
+        }
+
+        memcpy(str, This->items[This->pos], len * sizeof(WCHAR));
+        rgelt[i++] = str;
+        This->pos++;
+    }
+
+    if (fetched)
+        *fetched = i;
+
+    return i == celt ? S_OK : S_FALSE;
 }
 
 static HRESULT WINAPI ACLShellSource_Skip(IEnumString *iface, ULONG celt)
 {
     ACLShellSource *This = impl_from_IEnumString(iface);
-    FIXME("(%p)->(%lu): stub\n", This, celt);
-    return E_NOTIMPL;
+    UINT remaining = This->count - This->pos;
+
+    TRACE("(%p)->(%lu)\n", This, celt);
+
+    if (celt >= remaining)
+    {
+        This->pos = This->count;
+        return S_FALSE;
+    }
+
+    This->pos += celt;
+    return S_OK;
 }
 
 static HRESULT WINAPI ACLShellSource_Reset(IEnumString *iface)
 {
     ACLShellSource *This = impl_from_IEnumString(iface);
-    FIXME("(%p): stub\n", This);
-    return E_NOTIMPL;
+
+    TRACE("(%p)\n", This);
+
+    This->pos = 0;
+    return S_OK;
 }
+
+static const IEnumStringVtbl ACLShellSourceVtbl;
+static const IACList2Vtbl ACListVtbl;
 
 static HRESULT WINAPI ACLShellSource_Clone(IEnumString *iface, IEnumString **ppenum)
 {
     ACLShellSource *This = impl_from_IEnumString(iface);
-    FIXME("(%p)->(%p): stub\n", This, ppenum);
-    return E_NOTIMPL;
+    ACLShellSource *clone;
+    UINT i;
+
+    TRACE("(%p)->(%p)\n", This, ppenum);
+
+    if (!ppenum)
+        return E_INVALIDARG;
+
+    *ppenum = NULL;
+
+    if (!(clone = calloc(1, sizeof(*clone))))
+        return E_OUTOFMEMORY;
+
+    clone->IEnumString_iface.lpVtbl = &ACLShellSourceVtbl;
+    clone->IACList2_iface.lpVtbl = &ACListVtbl;
+    clone->refCount = 1;
+    clone->dwOptions = This->dwOptions;
+    clone->pos = This->pos;
+
+    for (i = 0; i < This->count; i++)
+    {
+        if (!append_item(clone, This->items[i]))
+        {
+            clear_items(clone);
+            free(clone);
+            return E_OUTOFMEMORY;
+        }
+    }
+
+    *ppenum = &clone->IEnumString_iface;
+    return S_OK;
 }
 
 static const IEnumStringVtbl ACLShellSourceVtbl = {
@@ -162,8 +281,57 @@ static ULONG WINAPI ACList_Release(IACList2 *iface)
 static HRESULT WINAPI ACList_Expand(IACList2 *iface, LPCWSTR wstr)
 {
     ACLShellSource *This = impl_from_IACList2(iface);
-    FIXME("STUB:(%p) %s\n",This,debugstr_w(wstr));
-    return E_NOTIMPL;
+    WCHAR path[2 * MAX_PATH], pattern[2 * MAX_PATH + 2];
+    WIN32_FIND_DATAW fd;
+    const WCHAR *p, *name;
+    SIZE_T len;
+    HANDLE handle;
+
+    TRACE("(%p)->(%s)\n", This, debugstr_w(wstr));
+
+    clear_items(This);
+
+    if (!wstr || !*wstr)
+        return S_OK;
+
+    /* The text up to the last separator names the folder to enumerate, the
+     * remainder is the partial name the caller is completing. */
+    name = wstr;
+    for (p = wstr; *p; p++)
+        if (*p == '\\' || *p == '/')
+            name = p + 1;
+
+    len = name - wstr;
+    if (len >= ARRAY_SIZE(path))
+        return S_OK;
+
+    if (len)
+    {
+        memcpy(path, wstr, len * sizeof(WCHAR));
+        path[len] = 0;
+    }
+    else if (!GetCurrentDirectoryW(ARRAY_SIZE(path), path))
+        return S_OK;
+
+    if (wcslen(path) + 2 > ARRAY_SIZE(pattern))
+        return S_OK;
+
+    wcscpy(pattern, path);
+    wcscat(pattern, L"*");
+
+    if ((handle = FindFirstFileW(pattern, &fd)) == INVALID_HANDLE_VALUE)
+        return S_OK;
+
+    do
+    {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        if (!append_item(This, fd.cFileName))
+            break;
+    } while (FindNextFileW(handle, &fd));
+
+    FindClose(handle);
+    return S_OK;
 }
 
 static HRESULT WINAPI ACList_GetOptions(IACList2 *iface, DWORD *pdwFlag)
