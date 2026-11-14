@@ -645,7 +645,19 @@ HRESULT WINAPI RevokeDragDrop(HWND hwnd)
     return DRAGDROP_E_NOTREGISTERED;
 
   drop_target = GetPropW(hwnd, prop_oledroptarget);
-  if(drop_target) IDropTarget_Release(drop_target);
+  if (drop_target)
+  {
+      MEMORY_BASIC_INFORMATION info = {0};
+
+      /* Some apps free their target without revoking; a later revoke from another
+       * thread must not dereference the stale pointer. */
+      if (VirtualQuery(drop_target, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+          !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+          IDropTarget_Release(drop_target);
+      else
+          ERR("stale drop target %p for hwnd %p (state %#lx protect %#lx), not releasing\n",
+              drop_target, hwnd, info.State, info.Protect);
+  }
 
   RemovePropW(hwnd, prop_oledroptarget);
   RemovePropW(hwnd, prop_marshalleddroptarget);
