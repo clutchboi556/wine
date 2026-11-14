@@ -127,10 +127,79 @@ static void winstation_dump( struct object *obj, int verbose )
              winstation->flags, winstation->clipboard, winstation->atom_table );
 }
 
+/* The default DACL of the creating token only grants full access to the Users group, but a
+ * restricted token (as used by sandboxed processes) holds that group as deny-only, which
+ * leaves the process with no access to its own window station.  Windows grants full access to
+ * the logon user SID instead, and that SID stays enabled in a restricted token. */
+static bool winstation_grant_user_access( struct winstation *winstation )
+{
+    /* the user of the token that creates the station, as Windows' default station DACL names it */
+    const struct sid *user = token_get_user( current->process->token );
+    const struct acl *dacl;
+    struct security_descriptor *sd, *new_sd;
+    struct acl *new_dacl;
+    struct ace *ace, *dst;
+    size_t len;
+    unsigned int i;
+    int present;
+
+    if (!winstation->obj.sd || !user) return true;
+    if (!(dacl = sd_get_dacl( winstation->obj.sd, &present )) || !present) return true;
+
+    for (i = 0, ace = ace_first( dacl ); i < dacl->count; i++, ace = ace_next( ace ))
+    {
+        if (ace->type != ACCESS_ALLOWED_ACE_TYPE) continue;
+        if (!equal_sid( (const struct sid *)(ace + 1), user )) continue;
+        if ((ace->mask & GENERIC_ALL) == GENERIC_ALL) return true;  /* already granted */
+    }
+
+    len = sizeof(*ace) + sid_len( user );
+    if (dacl->size + len > 0xffff) return true;  /* ACL cannot grow any further */
+
+    if (!(new_dacl = mem_alloc( dacl->size + len ))) return false;
+    memcpy( new_dacl, dacl, dacl->size );
+    dst = (struct ace *)((char *)new_dacl + dacl->size);
+    set_ace( dst, user, ACCESS_ALLOWED_ACE_TYPE, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+             GENERIC_ALL );
+    new_dacl->size += len;
+    new_dacl->count++;
+
+    if (!(sd = mem_alloc( sizeof(*sd) + new_dacl->size )))
+    {
+        free( new_dacl );
+        return false;
+    }
+    sd->control = SE_DACL_PRESENT | (winstation->obj.sd->control & SE_DACL_AUTO_INHERITED);
+    sd->owner_len = sd->group_len = sd->sacl_len = 0;
+    sd->dacl_len = new_dacl->size;
+    memcpy( sd + 1, new_dacl, new_dacl->size );
+    free( new_dacl );
+
+    /* keep the owner, the group and the SACL that the creating token provided */
+    new_sd = set_sd_from_token_internal( sd, winstation->obj.sd, DACL_SECURITY_INFORMATION, NULL );
+    free( sd );
+    if (!new_sd) return false;
+
+    free( winstation->obj.sd );
+    winstation->obj.sd = new_sd;
+    return true;
+}
+
 static bool winstation_init( struct object *obj, const void *init_data )
 {
+    static const struct security_descriptor empty_sd;
     struct winstation *winstation = (struct winstation *)obj;
     const struct winstation_init_data *data = init_data;
+
+    /* window stations are securable objects, give them the default security descriptor of
+     * the creating token when the client didn't specify one */
+    if (!obj->sd)
+    {
+        if (!default_set_sd( obj, &empty_sd, OWNER_SECURITY_INFORMATION |
+                             GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION ))
+            return false;
+        if (!winstation_grant_user_access( winstation )) return false;
+    }
 
     if (!(winstation->desktop_names = create_namespace( 7 ))) return false;
 
@@ -249,6 +318,71 @@ static void desktop_dump( struct object *obj, int verbose )
              desktop->shared->flags, desktop->winstation, desktop->top_window, desktop->global_hooks );
 }
 
+/* Windows propagates the inheritable ACEs of the parent object to the objects created inside
+ * it.  Wine window stations used to carry no security descriptor at all, so a desktop created
+ * with an explicit deny-only DACL would end up with a DACL that grants nothing to anybody. */
+static bool desktop_inherit_winstation_dacl( struct desktop *desktop, struct winstation *winstation )
+{
+    const struct acl *dacl, *winstation_dacl;
+    const struct ace *ace;
+    struct security_descriptor *sd, *new_sd;
+    struct acl *new_dacl;
+    struct ace *dst;
+    unsigned int i, len = 0, count = 0;
+    int present;
+
+    /* nothing to inherit from, or access is not restricted */
+    if (!desktop->obj.sd || !winstation->obj.sd) return true;
+    if (desktop->obj.sd->control & SE_DACL_PROTECTED) return true;
+    if (!(dacl = sd_get_dacl( desktop->obj.sd, &present )) || !present) return true;
+    for (i = 0, ace = ace_first( dacl ); i < dacl->count; i++, ace = ace_next( ace ))
+        if (ace->type == ACCESS_ALLOWED_ACE_TYPE) return true;  /* DACL already grants access */
+
+    if (!(winstation_dacl = sd_get_dacl( winstation->obj.sd, &present )) || !present) return true;
+    for (i = 0, ace = ace_first( winstation_dacl ); i < winstation_dacl->count; i++, ace = ace_next( ace ))
+    {
+        if (ace->type != ACCESS_ALLOWED_ACE_TYPE) continue;
+        len += ace->size;
+        count++;
+    }
+    if (!count || dacl->size + len > 0xffff) return true;
+
+    /* the inherited ACEs go after the ACL the client specified, so that its deny ACEs
+     * are still evaluated first */
+    if (!(new_dacl = mem_alloc( dacl->size + len ))) return false;
+    memcpy( new_dacl, dacl, dacl->size );
+    dst = (struct ace *)((char *)new_dacl + dacl->size);
+    for (i = 0, ace = ace_first( winstation_dacl ); i < winstation_dacl->count; i++, ace = ace_next( ace ))
+    {
+        if (ace->type != ACCESS_ALLOWED_ACE_TYPE) continue;
+        memcpy( dst, ace, ace->size );
+        dst->flags |= INHERITED_ACE;
+        dst = ace_next( dst );
+    }
+    new_dacl->size += len;
+    new_dacl->count += count;
+
+    if (!(sd = mem_alloc( sizeof(*sd) + new_dacl->size )))
+    {
+        free( new_dacl );
+        return false;
+    }
+    sd->control = SE_DACL_PRESENT | SE_DACL_AUTO_INHERITED;
+    sd->owner_len = sd->group_len = sd->sacl_len = 0;
+    sd->dacl_len = new_dacl->size;
+    memcpy( sd + 1, new_dacl, new_dacl->size );
+    free( new_dacl );
+
+    /* keep the owner, group and SACL that the client asked for */
+    new_sd = set_sd_from_token_internal( sd, desktop->obj.sd, DACL_SECURITY_INFORMATION, NULL );
+    free( sd );
+    if (!new_sd) return false;
+
+    free( desktop->obj.sd );
+    desktop->obj.sd = new_sd;
+    return true;
+}
+
 static bool desktop_init( struct object *obj, const void *init_data )
 {
     struct desktop *desktop = (struct desktop *)obj;
@@ -256,6 +390,8 @@ static bool desktop_init( struct object *obj, const void *init_data )
     const struct desktop_init_data *data = init_data;
     unsigned int flags = data->flags;
     struct desktop *current_desktop;
+
+    if (!desktop_inherit_winstation_dacl( desktop, winstation )) return false;
 
     /* inherit DF_WINE_*_DESKTOP flags if none of them are specified */
     if (!(flags & (DF_WINE_ROOT_DESKTOP | DF_WINE_VIRTUAL_DESKTOP)) &&

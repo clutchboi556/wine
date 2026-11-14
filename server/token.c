@@ -1072,6 +1072,11 @@ const struct sid *token_get_primary_group( struct token *token )
     return token->primary_group;
 }
 
+const struct sid *token_get_user( struct token *token )
+{
+    return token->user;
+}
+
 unsigned int token_get_session_id( struct token *token )
 {
     return token->session_id;
