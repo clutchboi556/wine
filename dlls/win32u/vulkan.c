@@ -26,6 +26,9 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ntstatus.h"
@@ -1951,6 +1954,84 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     return res;
 }
 
+/* WINEWAYLAND_TIME_D3D=1: temporary measurement of how long a D3D present
+ * takes and how often it happens.  Frames that go through DXVK/wined3d never
+ * touch window_surface_flush, so nothing else observes the canvas.  Reports
+ * one line per 64 presents on stderr; silent when the variable is unset. */
+static inline ULONGLONG present_time_us(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (ULONGLONG)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int present_time = -1;
+static ULONGLONG pr_n, pr_us, pr_us_max, pr_iv, pr_iv_max, pr_area, pr_last;
+
+/* Per-swapchain-size counters, so a swapchain that never presents (or presents
+ * black) can be told apart from the ones that carry the UI. */
+struct present_stat { unsigned int w, h; ULONGLONG n, us, us_max, iv, iv_max; };
+static struct present_stat pstats[32];
+static int pstats_n;
+
+static struct present_stat *present_stat_get( unsigned int w, unsigned int h )
+{
+    int i;
+    for (i = 0; i < pstats_n; i++)
+        if (pstats[i].w == w && pstats[i].h == h) return &pstats[i];
+    if (pstats_n == ARRAY_SIZE(pstats)) return NULL;
+    memset( &pstats[pstats_n], 0, sizeof(pstats[0]) );
+    pstats[pstats_n].w = w;
+    pstats[pstats_n].h = h;
+    return &pstats[pstats_n++];
+}
+
+static BOOL present_timing_enabled(void)
+{
+    if (present_time < 0) present_time = getenv( "WINEWAYLAND_TIME_D3D" ) != NULL;
+    return present_time;
+}
+
+/* WINEWAYLAND_TRACE_PRESENT=1: log every present before and after the host
+ * call, to tell a present that blocks in the host driver from one that never
+ * happens. */
+static int present_verbose = -1;
+static BOOL present_trace_enabled(void)
+{
+    if (present_verbose < 0) present_verbose = getenv( "WINEWAYLAND_TRACE_PRESENT" ) != NULL;
+    return present_verbose;
+}
+
+static void present_trace( const char *what, struct swapchain *sc, int res )
+{
+    fprintf( stderr, "PRESENT-%s hwnd=%p %ux%u res=%d t=%llu\n", what, sc->surface->hwnd,
+             sc->extents.width, sc->extents.height, res, (unsigned long long)present_time_us() );
+    fflush( stderr );
+}
+
+static void present_report(void)
+{
+    ULONGLONG n = pr_n;
+    int i;
+    if (!n) return;
+    fprintf( stderr, "D3DPRESENT n=%llu area=%llu present_us_mean=%llu present_us_max=%llu "
+             "interval_us_mean=%llu interval_us_max=%llu fps_mean=%llu\n",
+             (unsigned long long)n, (unsigned long long)(pr_area / n),
+             (unsigned long long)(pr_us / n), (unsigned long long)pr_us_max,
+             (unsigned long long)(pr_iv / (n ? n : 1)), (unsigned long long)pr_iv_max,
+             (unsigned long long)(pr_iv ? 1000000 * n / pr_iv : 0) );
+    for (i = 0; i < pstats_n; i++)
+        fprintf( stderr, "D3DPRESENT size=%ux%u n=%llu present_us_mean=%llu present_us_max=%llu "
+                 "interval_us_mean=%llu fps_mean=%llu\n", pstats[i].w, pstats[i].h,
+                 (unsigned long long)pstats[i].n,
+                 (unsigned long long)(pstats[i].n ? pstats[i].us / pstats[i].n : 0),
+                 (unsigned long long)pstats[i].us_max,
+                 (unsigned long long)(pstats[i].iv / (pstats[i].n ? pstats[i].n : 1)),
+                 (unsigned long long)(pstats[i].iv ? 1000000 * pstats[i].n / pstats[i].iv : 0) );
+    pr_n = pr_us = pr_us_max = pr_iv = pr_iv_max = pr_area = 0;
+    for (i = 0; i < pstats_n; i++) pstats[i].n = pstats[i].us = pstats[i].us_max = pstats[i].iv = pstats[i].iv_max = 0;
+}
+
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
@@ -1959,6 +2040,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
     VkResult res;
+    ULONGLONG ts = 0;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
@@ -1989,7 +2071,52 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         client_surface_update( surface->client );
     }
 
+    if (present_trace_enabled())
+    {
+        uint32_t i;
+        for (i = 0; i < present_info->swapchainCount; i++)
+            present_trace( "BEGIN", swapchain_from_handle( client_swapchains[i] ), 0 );
+    }
+
+    if (present_timing_enabled()) ts = present_time_us();
+
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+
+    if (present_trace_enabled())
+    {
+        uint32_t i;
+        for (i = 0; i < present_info->swapchainCount; i++)
+            present_trace( "END", swapchain_from_handle( client_swapchains[i] ), res );
+    }
+
+    if (ts)
+    {
+        ULONGLONG t1 = present_time_us(), us = t1 - ts, iv;
+        pr_n++;
+        pr_us += us;
+        if (us > pr_us_max) pr_us_max = us;
+        if (pr_last) { iv = ts - pr_last; pr_iv += iv; if (iv > pr_iv_max) pr_iv_max = iv; }
+        pr_last = t1;
+        if (present_info->swapchainCount)
+        {
+            struct swapchain *sc = swapchain_from_handle( client_swapchains[0] );
+            pr_area += (ULONGLONG)sc->extents.width * sc->extents.height;
+        }
+        {
+            uint32_t i;
+            for (i = 0; i < present_info->swapchainCount; i++)
+            {
+                struct swapchain *sc = swapchain_from_handle( client_swapchains[i] );
+                struct present_stat *st = present_stat_get( sc->extents.width, sc->extents.height );
+                if (!st) continue;
+                st->n++;
+                st->us += us;
+                if (us > st->us_max) st->us_max = us;
+                if (iv) { st->iv += iv; if (iv > st->iv_max) st->iv_max = iv; }
+            }
+        }
+        if (pr_n == 64) { present_report(); pr_last = 0; }
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
