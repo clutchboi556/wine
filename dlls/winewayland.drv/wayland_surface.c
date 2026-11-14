@@ -34,6 +34,7 @@
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+WINE_DECLARE_DEBUG_CHANNEL(handoff);
 
 /* EXPERIMENT (2026-10-07): commit a palette's size on its own so the compositor
  * scales the frame it already has to a new size while the contents are deferred
@@ -857,11 +858,19 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
     rect = map_rect_to_surface(surface, rect);
 
     TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
+    TRACE_(handoff)("client rect hwnd=%p dest %ldx%ld at %ld,%ld\n",
+                    client->client.hwnd,
+                    (long)(rect.right - rect.left), (long)(rect.bottom - rect.top),
+                    (long)rect.left, (long)rect.top);
 
     if (client->wl_subsurface)
     {
         wl_subsurface_set_position(client->wl_subsurface, rect.left, rect.top);
-        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
+        /* Stacking is rebuilt by wayland_restack_client_surfaces() when the
+         * set of client surfaces of this toplevel changes: placing "above the
+         * parent" here, once per presented frame, would sink this surface
+         * below every sibling, i.e. below the client area of every other
+         * window of the same toplevel. */
     }
 
     if (rect.left != rect.right && rect.top != rect.bottom)
@@ -1526,18 +1535,44 @@ POINT map_point_from_surface(struct wayland_surface *surface, POINT point)
     return point;
 }
 
+static void wayland_client_surface_unlink(struct wayland_client_surface *client);
+
 static void wayland_client_surface_destroy(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
 
     TRACE("%s\n", debugstr_client_surface(client));
 
+    wayland_client_surface_unlink(surface);
     if (surface->wp_viewport)
         wp_viewport_destroy(surface->wp_viewport);
     if (surface->wl_subsurface)
         wl_subsurface_destroy(surface->wl_subsurface);
     if (surface->wl_surface)
         wl_surface_destroy(surface->wl_surface);
+}
+
+static void wayland_client_surface_unlink(struct wayland_client_surface *client)
+{
+    struct wayland_win_data *toplevel_data;
+    struct wayland_surface *surface;
+    struct wayland_client_surface **link;
+
+    if (!client->toplevel || !(toplevel_data = wayland_win_data_get(client->toplevel))) return;
+    if ((surface = toplevel_data->wayland_surface))
+    {
+        for (link = &surface->clients; *link; link = &(*link)->next_client)
+        {
+            if (*link == client)
+            {
+                *link = client->next_client;
+                wayland_restack_client_surfaces(surface);
+                break;
+            }
+        }
+        client->next_client = NULL;
+    }
+    wayland_win_data_release(toplevel_data);
 }
 
 static void wayland_client_surface_detach(struct client_surface *client)
@@ -1570,12 +1605,34 @@ static void wayland_client_surface_update(struct client_surface *client)
     wayland_win_data_release(data);
 }
 
+static ULONGLONG client_present_serial;
+
+/* Whether a stale client attached to the same toplevel and window is still
+ * stacked above this one in surface->clients. */
+static BOOL wayland_client_surface_is_topmost(struct wayland_surface *owner_surface,
+                                              struct wayland_client_surface *client)
+{
+    struct wayland_client_surface *other;
+    BOOL found = FALSE;
+
+    for (other = owner_surface->clients; other; other = other->next_client)
+    {
+        if (other == client) found = TRUE;
+        else if (found && other->client.hwnd == client->client.hwnd) return FALSE;
+    }
+    return TRUE;
+}
+
 static void wayland_client_surface_present(struct client_surface *client, HDC hdc)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
+
+    surface->present_serial = ++client_present_serial;
+    TRACE_(handoff)("client present wl=%p hwnd=%p serial=%u\n", surface->wl_surface, hwnd,
+                    (unsigned int)surface->present_serial);
 
     if (!(data = wayland_win_data_get(toplevel))) return;
 
@@ -1589,6 +1646,17 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
             wayland_surface->processing.processed &&
             wayland_surface_reconfigure(wayland_surface))
         {
+            wl_surface_commit(wayland_surface->wl_surface);
+        }
+
+        /* The application may create the replacement drawable for a window
+         * before releasing the old one, leaving a stale client subsurface
+         * attached to the same window.  The one presenting now owns the
+         * visible contents, so stack it above that sibling. */
+        if (!wayland_client_surface_is_topmost(wayland_surface, surface))
+        {
+            TRACE_(handoff)("restack for presenter wl=%p hwnd=%p\n", surface->wl_surface, hwnd);
+            wayland_restack_popups(toplevel);
             wl_surface_commit(wayland_surface->wl_surface);
         }
     }
@@ -1628,6 +1696,8 @@ struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format, 
         goto err;
     }
     wl_surface_set_user_data(client->wl_surface, hwnd);
+    TRACE_(handoff)("client create wl=%p hwnd=%p format=%d raw=%d\n",
+                    client->wl_surface, hwnd, pixel_format, raw);
 
     /* Let parent handle all pointer events. */
     empty_region = wl_compositor_create_region(process_wayland.wl_compositor);
@@ -1670,8 +1740,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
 
         if (client->toplevel && (toplevel_data = wayland_win_data_get(client->toplevel)))
         {
-            if ((surface = toplevel_data->wayland_surface) && surface->client_ref == client->wl_surface)
-                surface->client_ref = NULL;
+            if ((surface = toplevel_data->wayland_surface))
+                wayland_client_surface_unlink(client);
             wayland_win_data_release(toplevel_data);
         }
         client->toplevel = 0;
@@ -1698,9 +1768,18 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
         wl_subsurface_set_desync(client->wl_subsurface);
 
         client->toplevel = toplevel;
-        surface->client_ref = client->wl_surface;
-        TRACE("client %p attached under toplevel hwnd=%p surface=%p, client_ref=%p\n",
-              client, toplevel, surface, surface->client_ref);
+        client->next_client = NULL;
+        {
+            /* Append: deepest windows are created last, so this keeps an
+             * ancestor's client area below its children's. */
+            struct wayland_client_surface **tail = &surface->clients;
+            while (*tail) tail = &(*tail)->next_client;
+            *tail = client;
+        }
+        TRACE("client %p attached under toplevel hwnd=%p surface=%p\n",
+              client, toplevel, surface);
+        TRACE_(handoff)("client attach hwnd=%p toplevel=%p visible=%d\n",
+                        client->client.hwnd, toplevel, client->client.visible);
         wayland_surface_reconfigure_client(surface, client, rect);
         /* the new subsurface came in on top of the popups; restore their order */
         wayland_restack_popups(toplevel);

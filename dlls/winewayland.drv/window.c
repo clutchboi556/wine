@@ -1161,10 +1161,99 @@ static void wayland_configure_window(HWND hwnd)
 }
 
 /**********************************************************************
+ *           wayland_client_surface_sort_siblings
+ *
+ * Order clients of one window by their last presentation, oldest first.
+ * Some applications create the replacement host drawable for a window (a
+ * new swapchain) before releasing the old one, so two client subsurfaces
+ * share one HWND.  Only the surface that presented last has up-to-date
+ * contents, hence it must be the topmost of the two: otherwise the stale
+ * one keeps covering it with the last image of its destroyed swapchain.
+ */
+void wayland_client_surface_sort_siblings(struct wayland_surface *owner_surface)
+{
+    struct wayland_client_surface **prev_a, **prev_b;
+    struct wayland_client_surface *a, *b, *next_a, *next_b;
+
+    for (;;)
+    {
+        for (prev_a = &owner_surface->clients; (a = *prev_a); prev_a = &a->next_client)
+        {
+            for (prev_b = &a->next_client; (b = *prev_b); prev_b = &b->next_client)
+            {
+                if (b->client.hwnd != a->client.hwnd ||
+                    b->present_serial >= a->present_serial) continue;
+
+                next_a = a->next_client;
+                next_b = b->next_client;
+                if (prev_b == &a->next_client)
+                {
+                    *prev_a = b;
+                    b->next_client = a;
+                    a->next_client = next_b;
+                }
+                else
+                {
+                    *prev_a = b;
+                    b->next_client = next_a;
+                    *prev_b = a;
+                    a->next_client = next_b;
+                }
+                goto restart;
+            }
+        }
+        return;
+restart:;
+    }
+}
+
+/**********************************************************************
+ *           wayland_restack_client_surfaces
+ *
+ * Stack the client (GL/Vulkan) subsurfaces attached under a toplevel in the
+ * order their windows were created, i.e. with an ancestor window's client
+ * area below those of its children, and return the wl_surface of the
+ * topmost one, so that the owner's popups can be placed above all of them.
+ *
+ * Wayland keeps a new subsurface on top of its siblings only until it is
+ * placed, and placing it "above the parent" puts it under every sibling.
+ * wayland_surface_reconfigure_client() used to do exactly that once per
+ * presented frame, so with more than one client surface under a toplevel the
+ * first one stayed on top: the client areas of nested child windows (Fusion's
+ * drawing area is five windows deep) were drawn and committed but always came
+ * out hidden behind an ancestor's client area.
+ */
+struct wl_surface *wayland_restack_client_surfaces(struct wayland_surface *owner_surface)
+{
+    struct wayland_client_surface *client;
+    struct wl_surface *ref = owner_surface->wl_surface;
+
+    wayland_client_surface_sort_siblings(owner_surface);
+
+    TRACE_(handoff)("restack owner hwnd=%p stack (bottom->top):", owner_surface->hwnd);
+    for (client = owner_surface->clients; client; client = client->next_client)
+    {
+        if (!client->wl_subsurface) continue;
+        wl_subsurface_place_above(client->wl_subsurface, ref);
+        TRACE_(handoff)(" hwnd=%p wl=%p fmt=%d(%dx%d at %d,%d,%s) serial=%u", client->client.hwnd,
+                        client->wl_surface, client->client.format,
+                        (int)(client->rect.right - client->rect.left),
+                        (int)(client->rect.bottom - client->rect.top),
+                        (int)client->rect.left, (int)client->rect.top,
+                        client->client.visible ? "vis" : "hid",
+                        (unsigned int)client->present_serial);
+        ref = client->wl_surface;
+    }
+    TRACE_(handoff)("\n");
+
+    return ref;
+}
+
+/**********************************************************************
  *           wayland_restack_popups
  *
  * Stack every popup subsurface owned by a toplevel in Win32 z-order, above
- * the toplevel's client (GL/Vulkan) subsurface if it has one, else directly
+ * the toplevel's client (GL/Vulkan) subsurfaces if it has any, else directly
  * above the toplevel. Wayland keeps a new subsurface on top of its siblings
  * only until it is placed, and placing it "above the parent" puts it under
  * all of them, so the order has to be rebuilt from Win32's.
@@ -1183,7 +1272,7 @@ void wayland_restack_popups(HWND owner)
         wayland_win_data_release(owner_data);
         return;
     }
-    ref = owner_surface->client_ref ? owner_surface->client_ref : owner_surface->wl_surface;
+    ref = wayland_restack_client_surfaces(owner_surface);
 
     /* walk the top-level windows from bottom-most to top-most */
     hwnd = NtUserGetWindowRelative(desktop, GW_CHILD);
@@ -1203,7 +1292,7 @@ void wayland_restack_popups(HWND owner)
     }
 
     TRACE("owner=%p %d popup(s) restacked above %s\n", owner, placed,
-          owner_surface->client_ref ? "client surface" : "owner");
+          owner_surface->clients ? "client surfaces" : "owner");
     wl_surface_commit(owner_surface->wl_surface);
     wayland_win_data_release(owner_data);
 }

@@ -269,6 +269,13 @@ struct wayland_client_surface
     struct wl_surface *wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
+    /* Last time this surface presented a frame; used to rank clients that
+     * share one window (an app may create the replacement drawable before
+     * releasing the old one) so that the stale one stays below. */
+    ULONGLONG present_serial;
+    /* Next client subsurface attached under the same toplevel, in the order
+     * their windows created them (bottom-most window first). */
+    struct wayland_client_surface *next_client;
 };
 
 extern struct wayland_client_surface *impl_from_client_surface(struct client_surface *client);
@@ -337,9 +344,10 @@ struct wayland_surface
         };
     };
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
-    /* For a toplevel: the wl_surface of the client (GL/Vulkan) subsurface last
-     * attached under it; owned popups are stacked above it. */
-    struct wl_surface *client_ref;
+    /* For a toplevel: the client (GL/Vulkan) subsurfaces attached under it, in
+     * the order their windows created them; owned popups are stacked above
+     * the topmost one. */
+    struct wayland_client_surface *clients;
     /* For a subsurface: the window rect as the compositor has applied it so
      * far (subsurface positions apply on the parent's commit, which the
      * compositor may not have processed when the next pointer event was
@@ -554,6 +562,8 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 void wayland_restack_popups(HWND owner);
+struct wl_surface *wayland_restack_client_surfaces(struct wayland_surface *owner_surface);
+void wayland_client_surface_sort_siblings(struct wayland_surface *owner_surface);
 void wayland_start_compositor_drag(struct wayland_win_data *data);
 void wayland_present_expired(void);
 BOOL wayland_has_pending_present(void);

@@ -35,6 +35,7 @@
 #include "wine/vulkan_driver.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+WINE_DECLARE_DEBUG_CHANNEL(handoff);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
@@ -54,6 +55,7 @@ static VkResult wayland_vulkan_surface_create(struct client_surface *client, con
     create_info_host.surface = surface->wl_surface;
     if ((res = instance->p_vkCreateWaylandSurfaceKHR(instance->host.instance, &create_info_host, NULL /* allocator */, handle))) return res;
     set_client_surface(hwnd, surface);
+    TRACE_(handoff)("vk surface wl=%p hwnd=%p format=%d\n", surface->wl_surface, hwnd, client->format);
 
     TRACE("Created surface=0x%s\n", wine_dbgstr_longlong(*handle));
     return VK_SUCCESS;
