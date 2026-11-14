@@ -83,22 +83,40 @@ static ULONG STDMETHODCALLTYPE dxcore_adapter_Release(IDXCoreAdapter *iface)
     return refcount;
 }
 
+static HRESULT dxcore_adapter_get_property_size(struct dxcore_adapter *adapter,
+        DXCoreAdapterProperty property, size_t *size);
+
 static BOOL STDMETHODCALLTYPE dxcore_adapter_IsValid(IDXCoreAdapter *iface)
 {
-    FIXME("iface %p stub!\n", iface);
-    return FALSE;
+    TRACE("iface %p.\n", iface);
+
+    /* Adapters are never invalidated: this implementation has no notification
+     * support, so a handle obtained from a list stays usable. */
+    return TRUE;
 }
 
 static BOOL STDMETHODCALLTYPE dxcore_adapter_IsAttributeSupported(IDXCoreAdapter *iface, REFGUID attribute)
 {
-    FIXME("iface %p, attribute %s stub!\n", iface, debugstr_guid(attribute));
+    TRACE("iface %p, attribute %s.\n", iface, debugstr_guid(attribute));
+
+    /* Every adapter wined3d enumerates can do D3D11 graphics, and any adapter
+     * with a Vulkan driver behind it can also run D3D12 through vkd3d. */
+    if (IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS)
+            || IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS))
+        return TRUE;
+
+    WARN("Unsupported attribute %s.\n", debugstr_guid(attribute));
     return FALSE;
 }
 
 static BOOL STDMETHODCALLTYPE dxcore_adapter_IsPropertySupported(IDXCoreAdapter *iface, DXCoreAdapterProperty property)
 {
-    FIXME("iface %p, property %u stub!\n", iface, property);
-    return FALSE;
+    struct dxcore_adapter *adapter = impl_from_IDXCoreAdapter(iface);
+    size_t size;
+
+    TRACE("iface %p, property %u.\n", iface, property);
+
+    return SUCCEEDED(dxcore_adapter_get_property_size(adapter, property, &size));
 }
 
 static HRESULT dxcore_adapter_get_property_size(struct dxcore_adapter *adapter,
@@ -529,7 +547,7 @@ static HRESULT STDMETHODCALLTYPE dxcore_adapter_factory_CreateAdapterList(IDXCor
 
     *out = NULL;
 
-    if (!num_attributes || !filter_attributes)
+    if (num_attributes && !filter_attributes)
         return E_INVALIDARG;
 
     if (!(list = calloc(1, sizeof(*list))))
