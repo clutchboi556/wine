@@ -560,7 +560,10 @@ BOOL WINAPI ImeProcessKey( HIMC himc, UINT vkey, LPARAM lparam, BYTE *state )
     if (!is_ime_hkl( GetKeyboardLayout( 0 ) )) return FALSE;
 
     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
-    ret = TRUE; /* TODO: should be ctx->fOpen */
+    /* A closed input context does not process keys: they must reach the app
+     * as-is, as on Windows. Claims here would rewrite them to VK_PROCESSKEY
+     * and hide the real key behind an IME round-trip that no driver answers. */
+    ret = ctx->fOpen;
     switch (LOWORD(vkey))
     {
         case VK_SHIFT:
