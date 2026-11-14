@@ -514,6 +514,13 @@ MSVCP_new_handler_func __cdecl set_new_handler_reset(int unused)
     return set_new_handler(NULL);
 }
 
+/* ?get_new_handler@std@@YAP6AXXZXZ */
+MSVCP_new_handler_func __cdecl get_new_handler(void)
+{
+    TRACE("%p\n", MSVCP_new_handler);
+    return MSVCP_new_handler;
+}
+
 /* _Container_base0 is used by apps compiled without iterator checking
  * (i.e. with _ITERATOR_DEBUG_LEVEL=0 ).
  * It provides empty versions of methods used by visual c++'s stl's
