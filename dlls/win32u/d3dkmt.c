@@ -902,6 +902,10 @@ BOOL get_vulkan_gpus( struct list *gpus )
     {
         struct gpu_info *gpu;
 
+        /* A CPU-type Vulkan device (lavapipe) has no display outputs, so it is
+         * not a display adapter and must not be published as one. */
+        if (devinfo[i].properties2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
+
         if (!(gpu = calloc( 1, sizeof(*gpu) ))) break;
         memcpy( &gpu->uuid, devinfo[i].id.deviceUUID, sizeof(gpu->uuid) );
         gpu->name = strdup( devinfo[i].properties2.properties.deviceName );
