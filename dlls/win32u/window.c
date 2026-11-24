@@ -2136,36 +2136,47 @@ static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *
  */
 static void update_surface_region( HWND hwnd )
 {
+    struct window_surface *surface;
     WND *win = get_win_ptr( hwnd );
     HRGN region, shape = 0;
     RECT visible;
+    BOOL rtl;
 
     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
-    if (!win->surface) goto done;
+    if ((surface = win->surface)) window_surface_add_ref( surface );
+    rtl = !!(win->dwExStyle & WS_EX_LAYOUTRTL);
+    /* Setting the shape flushes the surface, and a driver's flush can take the
+     * driver's own window lock.  The Wayland driver holds that lock while it
+     * calls back into win32u (NtUserGetWindowLongW in WindowPosChanged), which
+     * needs the user lock, so flushing under the window pointer deadlocks the
+     * two threads.  Hold a reference to the surface instead.  Callers must not
+     * hold a window pointer either (the user lock is recursive). */
+    release_win_ptr( win );
+    if (!surface) return;
 
     if (get_window_region( hwnd, FALSE, &shape, &visible )) goto done;
     if (shape)
     {
         region = NtGdiCreateRectRgn( 0, 0, visible.right - visible.left, visible.bottom - visible.top );
         NtGdiCombineRgn( shape, shape, region, RGN_AND );
-        if (win->dwExStyle & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
+        if (rtl) NtUserMirrorRgn( hwnd, shape );
         NtGdiDeleteObjectApp( region );
     }
-    window_surface_set_shape( win->surface, shape );
+    window_surface_set_shape( surface, shape );
 
     if (get_window_region( hwnd, TRUE, &region, &visible )) goto done;
-    if (!region) window_surface_set_clip( win->surface, shape );
+    if (!region) window_surface_set_clip( surface, shape );
     else
     {
         NtGdiOffsetRgn( region, -visible.left, -visible.top );
         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
-        window_surface_set_clip( win->surface, region );
+        window_surface_set_clip( surface, region );
         NtGdiDeleteObjectApp( region );
     }
 
 done:
     if (shape) NtGdiDeleteObjectApp( shape );
-    release_win_ptr( win );
+    window_surface_release( surface );
 }
 
 
@@ -2441,7 +2452,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (ret)
     {
-        update_surface_region( surface_win );
         if (((swp_flags & SWP_AGG_NOPOSCHANGE) != SWP_AGG_NOPOSCHANGE) ||
             (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW | SWP_STATECHANGED | SWP_FRAMECHANGED)))
             invalidate_dce( win, &old_rects.window );
@@ -2476,6 +2486,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (ret)
     {
+        /* Not under the window pointer: see update_surface_region(). */
+        update_surface_region( surface_win );
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
         register_window_surface( old_surface, new_surface );
         if (old_surface)
